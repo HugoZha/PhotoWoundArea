@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the accompanying article and this repository."
+type: software
+title: "SynthWound: an analytic ground-truth benchmark and attribution framework for photographic wound area measurement"
+abstract: >-
+  Reference implementation of a synthetic wound benchmark with analytically
+  known curved-surface area, an error-attribution protocol that relates
+  two-dimensional outline quality to area error, and a compact single-photograph
+  wound-area measurement pipeline used as an end-to-end validation carrier.
+authors:
+  - family-names: Lu
+    given-names: Guopei
+  - family-names: Zhang
+    given-names: Chi
+  - family-names: Zha
+    given-names: Yuguo
+year: 2026
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/HugoZha/PhotoWoundArea"
+keywords:
+  - wound area measurement
+  - analytic ground truth
+  - synthetic benchmark
+  - error attribution
+  - segmentation Dice
+  - pressure ulcers
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Lu
+      given-names: Guopei
+    - family-names: Zhang
+      given-names: Chi
+    - family-names: Zha
+      given-names: Yuguo
+  title: "SynthWound: An Analytic Benchmark and Attribution Framework for Photographic Wound Area Measurement"
+  journal: "Medical Image Analysis"
+  year: 2026
