@@ -13,12 +13,13 @@ script that regenerates it and the local artefact it reads.
 | Table 3, component ablation (N = 11) | A 0.166 / 73.5%; B 0.166 / 77.6%; C 0.868 / 9.2%; D 0.868 / 7.6% / R 0.994; E 0.863 / 8.1%; F 0.848 / 10.3% | `tools/ablation_summary.py` | `runs/ablation_summary.json`, `runs/abl_A_*` ... `runs/abl_F_*` |
 | Table 4, real end-to-end (N = 12) | median 12.62%, mean 18.8%, 4.30 cm², Dice 0.859, R = 0.992, 50% within 10%, signed bias +6.33% (9/12 high); small 26.86% / 4.07 cm² / Dice 0.807; large 6.32% / 4.75 cm² / Dice 0.924 | `tools/e2e_woundsdb.py --only_group test` | `runs/e2e_woundsdb_ms60/results.json`, `data/woundsdb_seg_ms/split.json` |
 | Table 5, drawing-rule sensitivity | 1 mesh pixel = 2.16 mm; 1.45% signed-bias shift; 1.95 pp small-wound error shift | `tools/calibrate_gt_caliber.py` | `runs/caliber_scan/` |
-| Supplementary Table S1, public 2D segmentation | 0.782 with black borders / HD95 12.5 px; 0.658 cropped on 302 held-out images; 0.435 cross-source atlas; flip averaging +0.007 | `wg_train/evaluate.py`, `wg_train/build_public_splits.py` | `runs/publicA/`, `runs/publicA_cropped/`, `data/public_splits*/split_report.json` |
+| Supplementary Table S1, public 2D segmentation | 0.782 with black borders on 302 held-out images / HD95 12.5 px; 0.658 after cropping on the rebuilt 436-image test split; 0.435 cross-source atlas; flip averaging +0.007 | `wg_train/evaluate.py`, `wg_train/build_public_splits.py` | `runs/publicA/`, `runs/publicA_cropped/`, `runs/publicA_cropped_ft/`, `data/public_splits*/split_report.json` |
 | Real-surface normal smoothing | 21.7% -> 7.3% at 6 mm, R = 0.978 | `tools/validate_real_surface.py` | WoundsDB `results/` point clouds |
 | Mobile framing search | mean Dice 0.201 -> 0.691; complete misses 6/14 -> 0/14 | App-side `predictBestROI`, offline driver `tools/e2e_woundsdb.py` | captured frame sets |
 
 ## Cohort bookkeeping
 
+* Public two-dimensional cohorts are two different patient-level splits: 2,042 pairs (1,453 / 287 / 302; 1,707 groups) with black borders retained, and 2,068 pairs (1,352 / 280 / 436; 1,731 groups) after cropping rebuilt the split. Their test sets are distinct; 0.782 and 0.658 are not measured on the same images.
 * WoundsDB cases: 32 / 7 / 8 (train / validation / test), patient-level.
 * Primary cohort: 12 test scenes from six unseen patients, each with a valid
   registered point cloud, >= 15 matched image features and a usable depth map.
