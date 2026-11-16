@@ -1,14 +1,14 @@
 """
-metrics.py — 分割质量评估指标（基于 numpy + scipy）
+metrics.py — segmentation quality metrics (based on numpy + scipy)
 ====================================================
 
-输入均为 (H,W) 的二值/灰度掩膜（任意 0/255 或 0/1，内部按 >0.5 二值化）。
-提供：
+Inputs are all (H,W) binary/grayscale masks (either 0/255 or 0/1; binarized internally at >0.5).
+Provided:
   - dice, iou, precision, recall, specificity
-  - hd95    : 95% Hausdorff 距离（表面误差，单位=像素）
-  - boundary_f1 : 容忍容差 tol 像素的边界 F1（Boundary F1 score）
+  - hd95    : 95% Hausdorff distance (surface error, unit = pixel)
+  - boundary_f1 : boundary F1 with a tolerance of tol pixels (Boundary F1 score)
 
-所有函数对"全空 / 全满"等退化情况做了稳健处理，不会除零或抛错。
+All functions handle degenerate cases such as "all empty / all full" robustly, without dividing by zero or raising errors.
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def iou(a, b) -> float:
 
 
 def precision_recall(a, b):
-    """以 a=预测, b=真值，返回 (precision, recall, specificity)。"""
+    """With a=prediction, b=ground truth, returns (precision, recall, specificity)."""
     a, b = _bin(a), _bin(b)
     tp = float((a & b).sum())
     fp = float((a & ~b).sum())
@@ -47,12 +47,12 @@ def precision_recall(a, b):
 
 
 def _surface_distances(a: np.ndarray, b: np.ndarray):
-    """返回 a 表面点到最近 b 表面点的距离数组（反之亦然由调用方合并）。"""
+    """Return an array of distances from a's surface points to the nearest b surface points (the reverse is merged by the caller)."""
     a, b = _bin(a), _bin(b)
-    dt_b = distance_transform_edt(1 - b)   # 每个 a 像素到最近 b 的距离
+    dt_b = distance_transform_edt(1 - b)   # distance from each a pixel to the nearest b
     dt_a = distance_transform_edt(1 - a)
-    da = dt_b[a > 0]                        # a 表面点到 b
-    db = dt_a[b > 0]                        # b 表面点到 a
+    da = dt_b[a > 0]                        # a surface points to b
+    db = dt_a[b > 0]                        # b surface points to a
     return da, db
 
 
@@ -68,7 +68,7 @@ def hd95(a, b) -> float:
 
 
 def boundary_f1(a, b, tol: int = 2) -> float:
-    """边界 F1：两掩膜边界在 tol 像素容差内的匹配程度。"""
+    """Boundary F1: how well the two masks' boundaries match within a tol-pixel tolerance."""
     a, b = _bin(a), _bin(b)
     ba = np.logical_xor(a, binary_erosion(a)).astype(np.uint8)
     bb = np.logical_xor(b, binary_erosion(b)).astype(np.uint8)
@@ -76,11 +76,11 @@ def boundary_f1(a, b, tol: int = 2) -> float:
         return 1.0
     if ba.sum() == 0 or bb.sum() == 0:
         return 0.0
-    # bb 边界点到最近 ba 边界的距离（<=tol 记为命中）
+    # distance from bb boundary points to the nearest ba boundary (<=tol counts as a hit)
     dt_a = distance_transform_edt(1 - ba)
     dt_b = distance_transform_edt(1 - bb)
-    rec = float((dt_a[bb > 0] <= tol).mean())   # 真值边界被预测覆盖
-    prec = float((dt_b[ba > 0] <= tol).mean())  # 预测边界对齐真值
+    rec = float((dt_a[bb > 0] <= tol).mean())   # ground-truth boundary covered by the prediction
+    prec = float((dt_b[ba > 0] <= tol).mean())  # predicted boundary aligned with ground truth
     return 2 * prec * rec / (prec + rec + 1e-6)
 
 

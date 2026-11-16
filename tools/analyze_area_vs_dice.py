@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 """analyze_area_vs_dice.py — attribute area error to two-dimensional outline quality.
 
-为什么需要这个脚本：
-    端到端面积误差的大盘数字（比如 44%）几乎没用 —— 它把"分割彻底失败"和
-    "分割略有偏差"混在一起。真正有用的问题是：
-        **当分割达到什么水平时，面积误差才能落到临床可接受区间？**
-    本脚本在「已知几何真值」的合成曲面上，对同一批样本同时记录
-    dice 与面积相对误差，按 dice 分档统计，给出这个对应关系。
+Why this script is needed:
+    The headline number of the end-to-end area error (e.g. 44%) is almost useless — it lumps
+    together "segmentation failed completely" and "segmentation is slightly off". The truly
+    useful question is:
+        **At what level of segmentation does the area error fall into a clinically
+        acceptable range?**
+    On synthetic surfaces with "known geometric ground truth", this script records both
+    dice and relative area error for the same set of samples, stratifies by dice, and
+    gives this correspondence.
 
-用法：
+Usage:
     python tools/analyze_area_vs_dice.py --model runs/publicA/best.pt \
         --patch_dir data/patches_public --n 40
 """
@@ -57,9 +60,9 @@ def main():
         mask = _keep_largest_cc(mask)
         d = dice(mask, gt)
 
-        # 真值掩膜下的面积（隔离几何/积分误差）
+        # area under the ground-truth mask (isolating geometric/integration error)
         a_gtmask = integ.integrate(rgb, gt, K, M, ("lidar", smp["depth"]))
-        # 模型掩膜下的面积（端到端）
+        # area under the model mask (end-to-end)
         a_pred = integ.integrate(rgb, mask, K, M, ("lidar", smp["depth"]))
         err = abs(a_pred["area_cm2"] - truth) / max(truth, 1e-9) * 100.0
         err_geom = abs(a_gtmask["area_cm2"] - truth) / max(truth, 1e-9) * 100.0
@@ -70,17 +73,17 @@ def main():
     errs_g = np.array([r["err_geom"] for r in recs])
     dices = np.array([r["dice"] for r in recs])
 
-    print(f"\n══ 面积误差归因（n={args.n}，部位={args.part_type}）══\n")
-    print(f"  纯几何/积分误差（用真值掩膜）: 均值 {errs_g.mean():5.2f}%  "
-          f"中位 {np.median(errs_g):5.2f}%   max {errs_g.max():5.2f}%")
-    print(f"  端到端（模型分割）          : 均值 {errs.mean():5.2f}%  "
-          f"中位 {np.median(errs):5.2f}%   max {errs.max():5.2f}%")
+    print(f"\n══ Area error attribution (n={args.n}, region={args.part_type}) ══\n")
+    print(f"  Pure geometric/integration error (ground-truth mask): mean {errs_g.mean():5.2f}%  "
+          f"median {np.median(errs_g):5.2f}%   max {errs_g.max():5.2f}%")
+    print(f"  End-to-end (model segmentation): mean {errs.mean():5.2f}%  "
+          f"median {np.median(errs):5.2f}%   max {errs.max():5.2f}%")
 
-    print("\n  ── 按分割质量分档 → 面积相对误差 ──")
-    print(f"  {'dice 区间':<14}{'样本':>5}{'面积误差均值':>14}{'中位':>10}{'最大':>10}")
+    print("\n  ── Stratified by segmentation quality → relative area error ──")
+    print(f"  {'dice interval':<14}{'samples':>5}{'mean area error':>14}{'median':>10}{'max':>10}")
     bins = [(0.95, 1.01, "≥0.95"), (0.90, 0.95, "0.90-0.95"),
             (0.80, 0.90, "0.80-0.90"), (0.50, 0.80, "0.50-0.80"),
-            (0.0, 0.50, "<0.50 失败")]
+            (0.0, 0.50, "<0.50 failure")]
     for lo, hi, label in bins:
         sel = (dices >= lo) & (dices < hi)
         if sel.sum() == 0:
@@ -92,25 +95,27 @@ def main():
 
     ok = dices >= 0.90
     if ok.sum():
-        print(f"\n  分割达标(dice≥0.90)的 {int(ok.sum())}/{args.n} 个样本中，"
-              f"面积误差中位 {np.median(errs[ok]):.2f}%")
-    print("\n  结论口径：面积误差 ≈ 分割误差的放大；表中的'几何误差'是这条链路的"
-          "\n  理论下限，端到端要接近它，前提是分割稳定在 dice 0.95 以上。")
+        print(f"\n  Among the {int(ok.sum())}/{args.n} samples that meet the segmentation "
+              "target (dice≥0.90), "
+              f"median area error {np.median(errs[ok]):.2f}%")
+    print("\n  Conclusion/convention: area error ≈ amplification of segmentation error; the "
+          "'geometric error' in the table is the theoretical lower bound of this chain;\n"
+          "  for end-to-end to approach it, segmentation must stay stably above dice 0.95.")
 
     gts = np.array([r["gt_area"] for r in recs])
 
-    # ---- 相关性 + 创面大小分层（MedIA 归因 Figure 素材）----
+    # ---- correlation + wound-size stratification (material for the MedIA attribution Figure) ----
     corr = float(np.corrcoef(dices, errs)[0, 1]) if len(dices) > 2 else float("nan")
-    print(f"\n  corr(dice, 面积误差) = {corr:+.3f}   (n={len(dices)})")
+    print(f"\n  corr(dice, area error) = {corr:+.3f}   (n={len(dices)})")
 
     med = float(np.median(gts))
     small = gts < med
     if int(small.sum()) and int((~small).sum()):
-        print(f"\n  ── 按创面大小分层（自适应阈值 {med:.1f} cm²）──")
-        for lab, sel in (("小创面", small), ("大创面", ~small)):
+        print(f"\n  ── Stratified by wound size (adaptive threshold {med:.1f} cm²) ──")
+        for lab, sel in (("small wound", small), ("large wound", ~small)):
             print(f"  {lab:<8} n={int(sel.sum()):>3}  "
-                  f"dice 中位 {np.median(dices[sel]):.3f}  "
-                  f"面积误差 中位 {np.median(errs[sel]):.2f}%  均值 {errs[sel].mean():.2f}%")
+                  f"median dice {np.median(dices[sel]):.3f}  "
+                  f"median area error {np.median(errs[sel]):.2f}%  mean {errs[sel].mean():.2f}%")
 
     summary = {
         "n": args.n,
@@ -133,7 +138,7 @@ def main():
     import json
     with open(out, "w") as f:
         json.dump({"summary": summary, "records": recs}, f, indent=2)
-    print(f"\n  明细+摘要已写入 {out}")
+    print(f"\n  details + summary written to {out}")
     return 0
 
 

@@ -31,7 +31,7 @@ from e2e_woundsdb import (
 )
 from wg_algorithms.seg_model import load_wound_model
 
-THR_SMALL = 18.7  # cm² 分层阈值
+THR_SMALL = 18.7  # cm² stratification threshold
 
 
 def dilate_mesh(mask_bool, r):
@@ -67,7 +67,7 @@ def main():
         sp = json.load(open(os.path.join(ROOT, args.split_file)))
         c2g = {s["case"]: s["group"] for s in sp["samples"]}
         cases = [c for c in cases if c2g.get(c[2].split(os.sep)[0]) == args.only_group]
-    print(f"▶ {len(cases)} 配对 | 模型 {args.model} | 组 {args.only_group}")
+    print(f"▶ {len(cases)} pairs | model {args.model} | group {args.only_group}")
     os.makedirs(os.path.join(ROOT, args.out), exist_ok=True)
 
     import time as _t
@@ -97,7 +97,7 @@ def main():
             sigma_px = recommended_normal_sigma(
                 intrinsics_to_K(fx, fy, cx, cy), float(np.nanmedian(depth_m)), target_mm=6.0)
             xyz_s = smooth_xyz(xyz_mm, sigma_px)
-            spacing_mm = nominal_spacing(xyz_mm)   # 网格 1 px 对应的真实物理间距(mm)
+            spacing_mm = nominal_spacing(xyz_mm)   # real physical spacing corresponding to 1 mesh px (mm)
             gap = spacing_mm * 4.0
             pred_mm2, _ = triangle_area_over_region(xyz_s, keep_pred, max_gap_mm=gap)
             gt0_mm2, _ = triangle_area_over_region(xyz_s, keep_gt, max_gap_mm=gap)
@@ -105,7 +105,7 @@ def main():
             for r in radii:
                 kg = dilate_mesh(keep_gt, r)
                 gmm2, covg = triangle_area_over_region(xyz_s, kg, max_gap_mm=gap)
-                cov_thr = 0.8 if r == 0 else 0.5   # r=0 基线严格与 e2e 一致(cov>=0.8)
+                cov_thr = 0.8 if r == 0 else 0.5   # r=0 baseline strictly matches e2e (cov>=0.8)
                 if gmm2 <= 0 or covg < cov_thr:
                     continue
                 signed = (pred_mm2 - gmm2) / gmm2 * 100.0
@@ -116,16 +116,17 @@ def main():
                         "spacing_mm": float(spacing_mm),
                         "per_r": per_r}
             print(f"  [{idx+1}/{len(cases)}] {rel} pred={pred_mm2/100:.2f} "
-                  f"gt0={gt0_mm2/100:.2f} r扫描{len(per_r)}档 ({_t.time()-t0:.1f}s)")
+                  f"gt0={gt0_mm2/100:.2f} r scanned {len(per_r)} bins ({_t.time()-t0:.1f}s)")
         except Exception as e:
             print(f"  ERR {rel}: {e}")
 
-    # ---- 固定队列：只保留 r=0 基线有效(cov>=0.8, 与 e2e 完全一致)的样本。
-    # 否则 r>0 放宽覆盖阈值会多进 3~4 例, 曲线上的点不是同一批样本, 不可发表。
+    # ---- fixed cohort: keep only samples with a valid r=0 baseline (cov>=0.8, exactly
+    # matching e2e). Otherwise relaxing the coverage threshold for r>0 would admit 3-4 more
+    # cases, so the points on the curve would not be the same set of samples — not publishable.
     cohort = [rel for rel in rec if 0 in rec[rel]["per_r"]]
     print(f"▶ fixed cohort = {len(cohort)} scenes (r=0 valid; cov>=0.8, matches e2e)")
 
-    # ---- 汇总：按 r 聚合，并分 small/large/case_8（全部限定在同一队列）
+    # ---- aggregate by r, and stratify into small/large/case_8 (all restricted to the same cohort)
     def collect(subset):
         out = {}
         for r in radii:
@@ -151,7 +152,7 @@ def main():
 
     summ = {k: collect(k) for k in ["overall", "small", "large", "case_8"]}
 
-    # ---- 找 r*：overall signed_med 跨 0 的插值半径
+    # ---- find r*: the interpolated radius where overall signed_med crosses zero
     rstar = None
     ov = summ["overall"]
     rs = sorted(ov.keys())
@@ -160,10 +161,10 @@ def main():
         if a <= 0 <= b or b <= 0 <= a:
             rstar = rs[i] + (0 - a) * (rs[i + 1] - rs[i]) / (b - a)
             break
-    if rstar is None:  # 不跨0则取最近0档
+    if rstar is None:  # if it does not cross zero, take the bin closest to zero
         rstar = min(rs, key=lambda r: abs(ov[r]["signed_med"]))
 
-    # ---- 用统一 r* 重评（线性插值每个 rel 在 r* 处的 signed/abs）
+    # ---- re-evaluate at a unified r* (linearly interpolate signed/abs at r* for each rel)
     def interp_at(rstar):
         res = {}
         for rel, d in rec.items():
@@ -205,10 +206,10 @@ def main():
         return {"signed_med": float(np.median(sg)), "abs_med": float(np.median(ab)),
                 "lt10": float(np.mean([a < 10 for a in ab]) * 100), "n": len(ab)}
 
-    before = {k: summ[k].get(0) for k in summ}          # r=0 校准前
+    before = {k: summ[k].get(0) for k in summ}          # r=0 before calibration
     after = {k: stats(k) for k in ["overall", "small", "large", "case_8"]}
 
-    # ---- 物理尺度换算：网格 1 px 的真实 mm 间距（来自点云，非假设）
+    # ---- physical scale conversion: real mm spacing of 1 mesh px (from the point cloud, not assumed)
     sp = np.array([rec[r]["spacing_mm"] for r in cohort], float)
 
     def zero_cross(rd):
@@ -246,7 +247,7 @@ def main():
     json.dump(out, open(os.path.join(ROOT, args.out, "caliber_sensitivity.json"), "w"),
               indent=2, ensure_ascii=False)
 
-    # ---- 画曲线
+    # ---- plot the curve
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -268,19 +269,19 @@ def main():
     plt.savefig(os.path.join(ROOT, args.out, "caliber_curve.png"), dpi=120)
     plt.close(fig)
 
-    print("\n=== 真值口径校准结果（固定队列）===")
-    print(f"r*（整体偏置归零口径）= {rstar:.2f} px = {rstar*mm_px:.2f} mm "
+    print("\n=== Ground-truth caliber calibration results (fixed cohort) ===")
+    print(f"r* (convention that zeroes the overall bias) = {rstar:.2f} px = {rstar*mm_px:.2f} mm "
           f"(1 mesh px = {mm_px:.2f} mm, IQR {physical['mm_per_mesh_px_p25']:.2f}-"
           f"{physical['mm_per_mesh_px_p75']:.2f})")
     if r8 is not None:
-        print(f"case_8 偏置归零口径 = {r8:.2f} px = {r8*mm_px:.2f} mm")
-    print(f"{'子集':8s} {'校准前abs%':>10s} {'校准后abs%':>10s} {'校准前<10%':>10s} {'校准后<10%':>10s}")
+        print(f"case_8 zero-bias convention = {r8:.2f} px = {r8*mm_px:.2f} mm")
+    print(f"{'subset':8s} {'abs% before':>10s} {'abs% after':>10s} {'<10% before':>10s} {'<10% after':>10s}")
     for k in ["overall", "small", "large", "case_8"]:
         b, a = before[k], after[k]
         print(f"{k:8s} {b['abs_med']:10.1f} {a['abs_med']:10.1f} "
               f"{b['lt10']:10.0f} {a['lt10']:10.0f}")
-    print(f"\n明细 -> {os.path.join(ROOT, args.out, 'caliber_sensitivity.json')}")
-    print(f"曲线 -> {os.path.join(ROOT, args.out, 'caliber_curve.png')}")
+    print(f"\ndetails -> {os.path.join(ROOT, args.out, 'caliber_sensitivity.json')}")
+    print(f"curve -> {os.path.join(ROOT, args.out, 'caliber_curve.png')}")
 
 
 if __name__ == "__main__":

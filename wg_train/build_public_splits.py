@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""build_public_splits.py — 多源公开数据集 -> 可直接训练的 train/val/test 划分。
+"""build_public_splits.py — multi-source public datasets -> ready-to-train train/val/test splits.
 
-为什么要这一步（而不是随机划分）：
-    公开伤口数据集里，同一个患者往往有**多次复诊/多个视角**的图（FUSeg 尤为明显）。
-    如果随机划分，同一患者的图会同时出现在 train 和 test，模型"见过"这个伤口，
-    指标会虚高 —— 文献里明确把这个叫 patient-level leakage。
-    本脚本按 **group（≈患者/就诊）** 划分，保证同一 group 的所有图只进一个子集。
+Why this step (instead of a random split):
+    In public wound datasets, the same patient often has images from **multiple follow-up visits / multiple views** (especially true for FUSeg).
+    With a random split, images of the same patient end up in both train and test, the model has "seen" that wound,
+    and metrics are inflated — the literature explicitly calls this patient-level leakage.
+    This script splits by **group (≈ patient/visit)**, ensuring all images of a group go into a single subset.
 
-产出：
-    <out>/train/{images,masks}     symlink 到原始文件（不额外占用磁盘）
+Output:
+    <out>/train/{images,masks}     symlinks to the original files (no extra disk usage)
     <out>/val/{images,masks}
     <out>/test/{images,masks}
     <out>/split_manifest.csv        filename, split, source, group, mask_frac
-    <out>/split_report.json        划分统计与泄漏检查结论
+    <out>/split_report.json        split statistics and leakage-check conclusions
 
-用法：
+Usage:
     python -m wg_train.build_public_splits --root data/public \
         --sources fuseg2021,medetec --out data/public_splits
     python -m wg_train.build_public_splits --root data/public --extra_synth data/synth3d
-    python -m wg_train.build_public_splits --infer_group     # 只看看 group 推断结果
+    python -m wg_train.build_public_splits --infer_group     # only inspect group-inference results
 """
 from __future__ import annotations
 
@@ -35,32 +35,32 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# --------------------------------------------------------------- group 推断
+# --------------------------------------------------------------- group inference
 _TAIL_NUM = re.compile(r"[_\-](?:rgb|img|image|color|left|right|crop|patch)?\d{1,4}$", re.I)
 
 
 def infer_group(stem: str, source: str, regex: str | None = None) -> str:
-    """从文件名推断 group id。
+    """Infer the group id from the filename.
 
-    优先级：
-      1. --group_regex 的第一个捕获组
-      2. 去掉源前缀 + 尾部序号后剩下的部分
-      3. 兜底：整个 stem（意味着一图一组，划分退化成随机划分，脚本会告警）
+    Priority:
+      1. the first capture group of --group_regex
+      2. what remains after stripping the source prefix + trailing number
+      3. fallback: the whole stem (which means one group per image; the split degenerates into a random split and the script warns)
     """
     if regex:
         m = re.search(regex, stem)
         if m and m.groups():
             return f"{source}::{m.group(1)}"
     s = stem
-    # 去掉标准化阶段加的 "<source>_<split>_" / "wt_" 前缀。
+    # Strip the "<source>_<split>_" / "wt_" prefixes added during normalization.
     # Group keys must be cleaned; otherwise all images collapse into one group.
-    #    （例如 "fuseg2021_train_0011" 若只剥 "fuseg2021_" 会剩下 "train"）。
+    #    (e.g. "fuseg2021_train_0011" would leave "train" if only "fuseg2021_" were removed).
     m = re.match(r"^(fuseg2021|medetec|azh|woundtissue)_(train|validation|val|test|all)_(.+)$", s)
     if m:
         source, s = m.group(1), m.group(3)
     elif s.startswith("wt_"):
         s = s[3:]
-    # 反复剥离尾部序号
+    # Repeatedly strip trailing numbers
     while True:
         s2 = _TAIL_NUM.sub("", s)
         if s2 == s or not s2:
@@ -69,7 +69,7 @@ def infer_group(stem: str, source: str, regex: str | None = None) -> str:
     return f"{source}::{s or stem}"
 
 
-# ------------------------------------------------------------------- 主流程
+# ------------------------------------------------------------------- main flow
 def _md5(path: str) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -83,14 +83,14 @@ def load_rows(root: str, sources: list[str]):
     for src in sources:
         mf = os.path.join(root, src, "manifest.csv")
         if not os.path.exists(mf):
-            print(f"  [!] 跳过 {src}：无 manifest ({mf})")
+            print(f"  [!] Skipping {src}: no manifest ({mf})")
             continue
         with open(mf) as f:
             for r in csv.DictReader(f):
                 r["_img"] = os.path.join(root, src, "images", r["file"])
                 r["_msk"] = os.path.join(root, src, "masks", r["file"])
                 rows.append(r)
-        print(f"  {src}: {sum(1 for r in rows if r['source'] == src)} 行")
+        print(f"  {src}: {sum(1 for r in rows if r['source'] == src)} rows")
     return rows
 
 
@@ -103,14 +103,14 @@ def build(args):
         for r in extra:
             r["_img"] = os.path.join(args.extra_synth, "images", r["file"])
             r["_msk"] = os.path.join(args.extra_synth, "masks", r["file"])
-        print(f"  合成数据并入: {len(extra)} 行")
+        print(f"  Synthetic data merged in: {len(extra)} rows")
         rows += extra
 
     if not rows:
-        print("❌ 没有任何可用样本。")
+        print("❌ No usable samples found.")
         return 1
 
-    # ---- 去重：完全相同的图若同时落进 train 和 test，就是最直接的数据泄漏
+    # ---- Deduplication: identical images landing in both train and test is the most direct form of data leakage
     seen, dedup, n_dup = {}, [], 0
     for r in rows:
         key = _md5(r["_img"])
@@ -120,10 +120,10 @@ def build(args):
         seen[key] = r
         dedup.append(r)
     if n_dup:
-        print(f"  去重：移除 {n_dup} 张完全重复图")
+        print(f"  Deduplication: removed {n_dup} exact duplicate images")
     kept = dedup
 
-    # 空掩膜过滤
+    # Empty-mask filtering
     dropped = 0
     kept2 = []
     for r in kept:
@@ -139,7 +139,7 @@ def build(args):
         kept2.append(r)
     kept = kept2
     if dropped:
-        print(f"  过滤 {dropped} 个样本（空/过小掩膜或文件缺失，阈值 {args.min_mask_frac}）")
+        print(f"  Filtered out {dropped} samples (empty/too-small mask or missing files, threshold {args.min_mask_frac})")
 
     for r in kept:
         r["group"] = infer_group(os.path.splitext(r["file"])[0], r["source"],
@@ -147,15 +147,15 @@ def build(args):
 
     groups = sorted({r["group"] for r in kept})
     n_samp = len(kept)
-    print(f"\n  样本 {n_samp} | 推断 group 数 {len(groups)} "
-          f"(平均 {n_samp/max(len(groups),1):.1f} 图/组)")
+    print(f"\n  samples {n_samp} | inferred groups {len(groups)} "
+          f"(avg. {n_samp/max(len(groups),1):.1f} images/group)")
     if len(groups) >= n_samp * 0.95:
-        print("  [!] group 数≈样本数，可能未能识别患者；此时划分等价于随机划分，"
-              "指标仍可能偏乐观。建议用 --group_regex 指定患者 ID 规则。")
+        print("  [!] group count ≈ sample count; patient identity may not have been recognized; in that case the split is equivalent to a random split, "
+              "and metrics may still be optimistic. Consider using --group_regex to specify a patient-ID rule.")
     elif args.show_groups:
-        print("  group 样例:", groups[:8])
+        print("  sample groups:", groups[:8])
 
-    # 按 group 划分
+    # Split by group
     rnd = random.Random(args.seed)
     gshuffled = sorted(groups)
     rnd.shuffle(gshuffled)
@@ -181,7 +181,7 @@ def build(args):
     for r in kept:
         sp = assign[r["group"]]
         stem = os.path.splitext(r["file"])[0]
-        # 带源前缀，避免不同源同名冲突
+        # Prefix with the source to avoid same-name collisions across sources
         uniq = f"{r['source']}__{stem}.png"
         li = os.path.join(out_root, sp, "images", uniq)
         lm = os.path.join(out_root, sp, "masks", uniq)
@@ -193,7 +193,7 @@ def build(args):
             target = os.path.abspath(target)
             try:
                 os.symlink(target, link)
-            except OSError:      # 文件系统不支持符号链接时退化复制
+            except OSError:      # fall back to copying when the filesystem does not support symlinks
                 import shutil
                 shutil.copy2(target, link)
         counts[sp] += 1
@@ -205,7 +205,7 @@ def build(args):
         w.writeheader()
         w.writerows(out_rows)
 
-    # ---- 泄漏检查：同一 group 不得跨 split
+    # ---- Leakage check: the same group must not span multiple splits
     by_split = {}
     for r in out_rows:
         by_split.setdefault(r["split"], set()).add(r["group"])
@@ -231,12 +231,12 @@ def build(args):
     with open(os.path.join(out_root, "split_report.json"), "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print(f"\n  划分结果: train={counts['train']}  val={counts['val']}  test={counts['test']}")
+    print(f"\n  Split result: train={counts['train']}  val={counts['val']}  test={counts['test']}")
     if leaks:
-        print(f"  [✗] 检测到组泄漏: {leaks}")
+        print(f"  [✗] Group leakage detected: {leaks}")
     else:
-        print("  ✓ 组泄漏检查通过：train/val/test 的 group 两两不相交")
-    print(f"  产出: {out_root}/split_manifest.csv, split_report.json")
+        print("  ✓ Group leakage check passed: train/val/test groups are pairwise disjoint")
+    print(f"  Output: {out_root}/split_manifest.csv, split_report.json")
     return 0
 
 
@@ -245,23 +245,23 @@ def main():
     ap.add_argument("--root", default=os.path.join(ROOT, "data", "public"))
     ap.add_argument("--sources", default="fuseg2021,medetec,azh,woundtissue")
     ap.add_argument("--extra_synth", default=None,
-                    help="额外并入的合成数据集目录（含 images/masks/manifest.csv）")
+                    help="Directory of an additional synthetic dataset to merge in (contains images/masks/manifest.csv)")
     ap.add_argument("--out", default=os.path.join(ROOT, "data", "public_splits"))
     ap.add_argument("--ratios", default="0.7,0.15,0.15")
     ap.add_argument("--min_mask_frac", type=float, default=0.001,
-                    help="掩膜占比下限，过滤空标注与近空样本")
+                    help="Lower bound on mask fraction; filters out empty and near-empty annotations")
     ap.add_argument("--group_regex", default=None,
-                    help="从文件名提取患者/group ID 的正则（第一个捕获组）")
+                    help="Regex to extract the patient/group ID from filenames (first capture group)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--show_groups", action="store_true")
     ap.add_argument("--infer_group", action="store_true",
-                    help="只打印 group 推断效果，不写文件")
+                    help="Only print group-inference results; do not write files")
     args = ap.parse_args()
 
     args.sources = [s.strip() for s in args.sources.split(",") if s.strip()]
     args.ratios = tuple(float(x) for x in args.ratios.split(","))
     if abs(sum(args.ratios) - 1.0) > 1e-6:
-        print("❌ ratios 之和必须为 1")
+        print("❌ ratios must sum to 1")
         return 1
 
     if args.infer_group:
@@ -270,7 +270,7 @@ def main():
             print(f"  {r['file'][:44]:<46} -> {infer_group(os.path.splitext(r['file'])[0], r['source'], args.group_regex)}")
         gs = {infer_group(os.path.splitext(r['file'])[0], r['source'], args.group_regex)
               for r in rows}
-        print(f"  {len(rows)} 样本 -> {len(gs)} group")
+        print(f"  {len(rows)} samples -> {len(gs)} groups")
         return 0
 
     return build(args)

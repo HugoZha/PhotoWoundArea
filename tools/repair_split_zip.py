@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""repair_split_zip.py — 从**缺少最后分卷**的 split zip 里抢救文件。
+"""repair_split_zip.py — rescue files from a split zip that is **missing its last volume**.
 
-为什么需要它：
-    WoundsDB 的 Patients 包被下载器切成 patients.zip + patients.z01…z05。
-    最后一个分卷缺失时（当前正是如此，只剩到 z04），整个 zip 的**中央目录丢了**，
-    `unzip` 会报一堆 "bad zipfile offset" 然后拒绝解压。
+Why it is needed:
+    The WoundsDB Patients archive was split by the downloader into
+    patients.zip + patients.z01…z05. When the last volume is missing (as is
+    currently the case — only up to z04 remains), the whole zip's **central
+    directory is lost**, and `unzip` reports a bunch of "bad zipfile offset"
+    errors and refuses to extract.
 
-    但 zip 有个特性可以救命：每个成员前面都有独立的 **local file header**
-    (`PK\\x03\\x04`)，里面有文件名、压缩方法、压缩后大小。中央目录只是一份"索引"，
-    丢了索引不等于丢了数据 —— 顺着数据流**逐成员扫描**就能把还完整的文件救出来。
+    But zip has a property that can save the day: every member is preceded by
+    its own **local file header** (`PK\\x03\\x04`), which contains the filename,
+    compression method, and compressed size. The central directory is only an
+    "index"; losing the index does not mean losing the data — by scanning
+    **member by member** along the data stream, the files that are still intact
+    can be rescued.
 
-用法：
-    # 1) 先看看能救出什么（只扫索引，不解压）
+Usage:
+    # 1) First see what can be rescued (scan the index only, no extraction)
     python tools/repair_split_zip.py --list
 
-    # 2) 只抢救需要的模态（默认 mask + photo）
+    # 2) Rescue only the modalities you need (default mask + photo)
     python tools/repair_split_zip.py --extract --filter mask,photo --out data/raw/woundsdb/patients_partial
 
-    # 3) 只扫前 N 个成员/试跑，确认无误再全量
+    # 3) Scan only the first N members / dry run; confirm it is correct before the full run
     python tools/repair_split_zip.py --extract --limit 200 --dry-run
 
-⚠️ 局限：缺失分卷横跨的成员会解压失败并被跳过（尾部少量文件救不回来）。
-   真要完整数据，还是应该用 tools/fetch_woundsdb.py 补齐最后一片后正常解压。
+⚠️ Limitation: members that span the missing volume will fail to decompress and be
+   skipped (a few files near the end cannot be rescued). To get the complete
+   data, you should still use tools/fetch_woundsdb.py to fetch the missing last
+   piece and then extract normally.
 """
 from __future__ import annotations
 
@@ -42,13 +49,17 @@ DD_SIG = b"PK\x07\x08"
 
 
 def autodetect_parts(paths: list[str]) -> list[tuple[str, int]]:
-    """自动判定分卷顺序与是否要跳过 spanning marker，返回 [(路径, 跳过的字节数)]。
+    """Auto-detect the volume order and whether to skip the spanning marker;
+    returns [(path, bytes skipped)].
 
     Info-ZIP split-archive conventions:
-      · 只有**第一卷**开头有 4 字节 spanning marker `PK\\x07\\x08`，其余卷直接是数据；
-      · **最后一卷**尾部才有 EOCD `PK\\x05\\x06`（也就是整个包的中央目录）；
-      · 最后一卷的文件名**不一定**排在最后（本次就是 patients.zip，而 z01 才是第一卷）。
-    所以不能按文件名排序，必须靠这两个标记定位。
+      · Only the **first volume** has a 4-byte spanning marker `PK\\x07\\x08` at
+        its start; the other volumes are pure data.
+      · Only the **last volume** has the EOCD `PK\\x05\\x06` at its tail (that
+        is, the central directory of the whole archive).
+      · The filename of the last volume is **not necessarily** last (in this
+        case it is patients.zip, while z01 is the first volume).
+    So you cannot sort by filename; you must locate them by these two markers.
     """
     exist = [p for p in paths if os.path.exists(p)]
     if not exist:
@@ -77,7 +88,7 @@ def autodetect_parts(paths: list[str]) -> list[tuple[str, int]]:
 
 
 class MultiPartStream:
-    """把多个分卷文件拼成一个只读的连续字节流。"""
+    """Concatenate multiple volume files into one read-only continuous byte stream."""
 
     def __init__(self, paths: list[str]):
         parts = autodetect_parts(paths)
@@ -94,22 +105,24 @@ class MultiPartStream:
         self.pos = 0
 
     def _locate(self, off: int) -> tuple[int, int]:
-        """全局偏移 -> (第几个文件, 文件内偏移，已计入 marker 跳过)。"""
+        """Global offset -> (which file, offset within file, already accounting for marker skip)."""
         for i, (o, s) in enumerate(zip(self.offsets, self.sizes)):
             if o <= off < o + s:
                 return i, off - o + self.skips[i]
         return len(self.fhs) - 1, self.sizes[-1]
 
     def read_at(self, off: int, n: int) -> bytes:
-        """从全局偏移 off 读 n 字节（跨分卷自动拼接），不足则返回实际读到的。"""
+        """Read n bytes from global offset off (auto-concatenated across volumes);
+        if fewer are available, return what was actually read."""
         out = bytearray()
         remaining = n
         cur = off
         while remaining > 0 and cur < self.total:
             i, local = self._locate(cur)
-            # 该分卷的**物理**大小 = 逻辑大小 + 跳过的 marker 字节数。
-            # ⚠️ 容易写错成 sizes[i] - local：那样会把 skip 重复扣一次，
-            #    越过分卷边界后读到的数据全是错的（解压会全部失败）。
+            # The **physical** size of this volume = logical size + skipped marker bytes.
+            # ⚠️ Easy to mistakenly write sizes[i] - local: that would deduct the skip a
+            #    second time, so all data read past the volume boundary would be wrong
+            #    (every decompression would fail).
             phys_size = self.sizes[i] + self.skips[i]
             self.fhs[i].seek(local)
             take = min(remaining, phys_size - local)
@@ -127,9 +140,10 @@ class MultiPartStream:
         for f in self.fhs:
             f.close()
 
-    # ---- 下面几个方法让它兼容 Python 标准库 zipfile ----
-    # 这样无需先把分卷拼成一个 3.7GB 的真实文件（磁盘不够时尤其重要），
-    # 直接 ZipFile(stream) 就能按中央目录精确定位并抽取成员。
+    # ---- The methods below make it compatible with Python's standard-library zipfile ----
+    # This way there is no need to first concatenate the volumes into a real 3.7GB
+    # file (especially important when disk space is insufficient): ZipFile(stream)
+    # can directly and precisely locate and extract members via the central directory.
     def seekable(self):
         return True
 
@@ -157,12 +171,12 @@ class MultiPartStream:
 
 
 def parse_local_header(st: MultiPartStream, off: int):
-    """返回 (name, method, comp_size, data_off, flags, next_off) 或 None。"""
+    """Return (name, method, comp_size, data_off, flags, next_off) or None."""
     hdr = st.read_at(off, 30)
     if len(hdr) < 30 or not hdr.startswith(LH_SIG):
         return None
-    # local header 布局(从偏移4起): ver H | flags H | method H | time H | date H
-    #                              crc I | csize I | usize I | namelen H | extralen H
+    # local header layout (from offset 4): ver H | flags H | method H | time H | date H
+    #                                    crc I | csize I | usize I | namelen H | extralen H
     (_ver, flags, method, _tm, _dt, _crc, csize, usize,
      nlen, elen) = struct.unpack("<HHHHHIIIHH", hdr[4:30])
     name = st.read_at(off + 30, nlen).decode("utf-8", "replace")
@@ -171,7 +185,7 @@ def parse_local_header(st: MultiPartStream, off: int):
 
 
 def scan_entries(st: MultiPartStream, limit=0, progress=True):
-    """顺序扫描 local header 得到成员列表。遇到中央目录停止。"""
+    """Scan local headers sequentially to get the member list. Stop at the central directory."""
     entries = []
     off = 0
     n = 0
@@ -179,10 +193,10 @@ def scan_entries(st: MultiPartStream, limit=0, progress=True):
     while off < st.total and bad_streak < 3:
         head = st.read_at(off, 4)
         if head.startswith(CD_SIG) or head.startswith(DD_SIG):
-            break                       # 到了中央目录，正文结束
+            break                       # reached the central directory, end of the body
         got = parse_local_header(st, off)
         if got is None:
-            # 数据区（ local header 之间有实际数据）—— 往下找下一个签名
+            # data area (actual data between local headers) — keep searching for the next signature
             off += 1
             bad_streak += 1
             continue
@@ -195,14 +209,14 @@ def scan_entries(st: MultiPartStream, limit=0, progress=True):
         off = data_off + csize
         n += 1
         if progress and n % 500 == 0:
-            print(f"   扫描中… {n} 个成员  {off/st.total*100:.0f}%", flush=True)
+            print(f"   scanning… {n} members  {off/st.total*100:.0f}%", flush=True)
         if limit and n >= limit:
             break
     return entries
 
 
 def _stream_inflate(st: MultiPartStream, off: int, size: int) -> bytes:
-    """按块读+流式 inflate；数据被截断时抛出 zlib.error。"""
+    """Read in chunks + streaming inflate; raises zlib.error when data is truncated."""
     do = zlib.decompressobj(-zlib.MAX_WBITS)
     out = bytearray()
     CH = 1 << 20
@@ -211,7 +225,7 @@ def _stream_inflate(st: MultiPartStream, off: int, size: int) -> bytes:
         take = min(CH, size - got)
         chunk = st.read_at(off + got, take)
         if not chunk:
-            raise EOFError("数据流被截断（缺分卷）")
+            raise EOFError("data stream truncated (missing volume)")
         out += do.decompress(chunk)
         got += len(chunk)
     out += do.flush()
@@ -219,7 +233,7 @@ def _stream_inflate(st: MultiPartStream, off: int, size: int) -> bytes:
 
 
 def wanted(name: str, filters: list[str] | None) -> str | None:
-    """返回该成员命中的模态名，未命中返回 None。"""
+    """Return the modality name this member matches, or None if it matches none."""
     base = os.path.basename(name)
     if not base:
         return None
@@ -236,46 +250,47 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--parts_dir", default=SPLIT_DIR)
-    ap.add_argument("--list", action="store_true", help="只列出能扫描到的成员")
-    ap.add_argument("--extract", action="store_true", help="执行抽取")
+    ap.add_argument("--list", action="store_true", help="only list members that can be scanned")
+    ap.add_argument("--extract", action="store_true", help="perform extraction")
     ap.add_argument("--filter", default="mask,photo",
-                    help="按文件名前缀筛选，逗号分隔；空字符串=全部")
+                    help="filter by filename prefix, comma-separated; empty string = all")
     ap.add_argument("--out", default=os.path.join(SPLIT_DIR, "patients_partial"))
-    ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个成员")
-    ap.add_argument("--dry-run", action="store_true", help="只统计不落盘")
+    ap.add_argument("--limit", type=int, default=0, help="only process the first N members")
+    ap.add_argument("--dry-run", action="store_true", help="only count, do not write to disk")
     ap.add_argument("--force-scan", action="store_true",
-                    help="强制跳过中央目录，改为顺序扫描 local header。"
-                         "当中央目录里的偏移量与真实布局不一致时用它")
+                    help="force skipping the central directory and scan local headers sequentially "
+                         "instead. Use this when offsets in the central directory do not match the "
+                         "real layout")
     args = ap.parse_args()
 
     parts = [os.path.join(args.parts_dir, p) for p in SPLIT_PARTS]
     if not os.path.exists(parts[0]):
-        print(f"❌ 找不到 {parts[0]}")
+        print(f"❌ {parts[0]} not found")
         return 1
     st = MultiPartStream(parts)
-    print(f"▶ 可用分卷 {len(st.paths)} 个，合计 {st.total/1e9:.2f} GB")
+    print(f"▶ {len(st.paths)} volumes available, total {st.total/1e9:.2f} GB")
     for p, s in zip(st.paths, st.sizes):
         print(f"   {os.path.basename(p):16s} {s/1e6:9.1f} MB")
 
-    # ---- 首选：中央目录还在（分卷齐全）时用 zipfile，最准也最快 ----
-    print("\n▶ 尝试按中央目录打开…")
+    # ---- Preferred: when the central directory is present (all volumes) use zipfile — most accurate and fastest ----
+    print("\n▶ Trying to open via the central directory…")
     try:
         if args.force_scan:
-            raise RuntimeError("--force-scan：跳过中央目录")
+            raise RuntimeError("--force-scan: skipping central directory")
         import collections
         import zipfile
         zf = zipfile.ZipFile(st)
         names = zf.namelist()
-        print(f"   ✅ 中央目录可用：{len(names)} 个成员")
+        print(f"   ✅ central directory available: {len(names)} members")
         cnt = collections.Counter(os.path.basename(n) for n in names)
-        print("\n   按文件名统计（前 15）：")
+        print("\n   counts by filename (top 15):")
         for k, v in cnt.most_common(15):
             print(f"     {k:44s} {v:5d}")
         if args.filter:
             fs = [f.lower() for f in args.filter.split(",") if f]
             hit = [n for n in names
                    if os.path.basename(n).lower().startswith(tuple(fs))]
-            print(f"\n   命中过滤 {args.filter}：{len(hit)} 个")
+            print(f"\n   matched filter {args.filter}: {len(hit)}")
             if args.extract:
                 os.makedirs(args.out, exist_ok=True)
                 ok = fail = 0
@@ -287,41 +302,41 @@ def main() -> int:
                     except Exception:
                         fail += 1
                     if (i + 1) % 200 == 0:
-                        print(f"   抽取中… {i+1}/{len(hit)}  成功 {ok}  失败 {fail}",
+                        print(f"   extracting… {i+1}/{len(hit)}  success {ok}  failed {fail}",
                               flush=True)
-                print(f"\n{'✅' if fail == 0 else '⚠️'} 成功 {ok}  失败 {fail}")
+                print(f"\n{'✅' if fail == 0 else '⚠️'} success {ok}  failed {fail}")
                 if not args.dry_run:
-                    print(f"   产物目录：{args.out}")
+                    print(f"   output directory: {args.out}")
                 if fail:
-                    print("   （失败的成员落在确实缺失的分卷上）")
+                    print("   (the failed members fall on the genuinely missing volume)")
         else:
-            print("\n（加 --extract 才会抽取）")
+            print("\n(add --extract to perform extraction)")
         st.close()
         return 0
     except Exception as e:
-        print(f"   ⚠️ 中央目录不可用（{type(e).__name__}: {str(e)[:80]}）")
-        print("      → 退化为顺序扫描 local header 的兜底方案")
+        print(f"   ⚠️ central directory unavailable ({type(e).__name__}: {str(e)[:80]})")
+        print("      → falling back to sequential local-header scanning")
         st.seek(0)
 
-    print("\n▶ 扫描成员索引（缺中央目录，靠 local header 逐个找）…")
+    print("\n▶ Scanning member index (no central directory, locating via local headers one by one)…")
     entries = scan_entries(st, limit=args.limit)
-    print(f"   找到 {len(entries)} 个成员，数据流推进到 {st.offsets and st.total}")
+    print(f"   found {len(entries)} members, data stream advanced to {st.offsets and st.total}")
 
     filters = [f for f in args.filter.split(",") if f] if args.filter else None
     hit = [e for e in entries if wanted(e["name"], filters)]
-    print(f"   命中过滤 {filters or '全部'}：{len(hit)} 个")
+    print(f"   matched filter {filters or 'all'}: {len(hit)}")
 
     if args.list:
         import collections
         cnt = collections.Counter(wanted(e["name"], None) for e in hit)
-        print("\n   按文件名统计：")
+        print("\n   counts by filename:")
         for k, v in cnt.most_common(20):
             print(f"     {k:42s} {v:5d}")
         st.close()
         return 0
 
     if not args.extract:
-        print("\n（加 --extract 才会抽取）")
+        print("\n(add --extract to perform extraction)")
         st.close()
         return 0
 
@@ -335,11 +350,11 @@ def main() -> int:
             if e["method"] == 0:
                 data = st.read_at(e["off"], e["csize"])
                 if len(data) < e["csize"]:
-                    raise EOFError("stored 数据不完整")
+                    raise EOFError("stored data incomplete")
             elif e["method"] == 8:
                 data = _stream_inflate(st, e["off"], e["csize"])
             else:
-                raise ValueError(f"不支持的压缩方法 {e['method']}")
+                raise ValueError(f"unsupported compression method {e['method']}")
             if not args.dry_run:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with open(dst, "wb") as f:
@@ -349,13 +364,13 @@ def main() -> int:
             fail += 1
             failed.append((e["name"], str(ex)[:60]))
         if (i + 1) % 100 == 0:
-            print(f"   抽取中… {i+1}/{len(hit)}  成功 {ok}  失败 {fail}", flush=True)
+            print(f"   extracting… {i+1}/{len(hit)}  success {ok}  failed {fail}", flush=True)
 
-    print(f"\n{'✅' if fail == 0 else '⚠️'} 成功 {ok}  失败 {fail}")
+    print(f"\n{'✅' if fail == 0 else '⚠️'} success {ok}  failed {fail}")
     if not args.dry_run:
-        print(f"   产物目录：{args.out}")
+        print(f"   output directory: {args.out}")
     for n, why in failed[:8]:
-        print(f"   失败样例：{n}  ({why})")
+        print(f"   failure sample: {n}  ({why})")
     st.close()
     return 0
 

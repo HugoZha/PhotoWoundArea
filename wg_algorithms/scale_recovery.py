@@ -22,20 +22,24 @@ class MetricReconstructor:
     def __init__(self, jitter_thresh_m: float = 0.02):
         """
         Args:
-            jitter_thresh_m: 单点跨帧位置抖动阈值（米），低于此值视为稳定跟踪。
+            jitter_thresh_m: per-point cross-frame position jitter threshold
+                (metres); below this value tracking is considered stable.
         """
         self.jitter_thresh_m = jitter_thresh_m
 
     def reconstruct(self, frames):
-        """输入 wg_ar_loader 加载的 frame 列表，输出聚合结果。
+        """Take a list of frames loaded by wg_ar_loader and output the aggregated
+        result.
 
         Returns:
             dict: {
-                "points": (N,3) 全局度量点云（米），
-                "identifiers": (N,) int64，
-                "observations_per_point": (N,) 每个点被多少帧观测到，
-                "jitter_per_point": (N,) 每个点跨帧位置标准差（米），
-                "stats": {...} 汇总指标，
+                "points": (N,3) global metric point cloud (metres),
+                "identifiers": (N,) int64,
+                "observations_per_point": (N,) number of frames observing each
+                    point,
+                "jitter_per_point": (N,) cross-frame position standard deviation
+                    of each point (metres),
+                "stats": {...} summary metrics,
             }
         """
         id_to_pts = {}      # id -> list[(frame_idx, xyz)]
@@ -55,7 +59,7 @@ class MetricReconstructor:
         for pid, pts in id_to_pts.items():
             arr = np.stack(pts, axis=0)            # (k,3)
             canon.append(arr.mean(axis=0))
-            jitter.append(float(arr.std(axis=0).mean()))  # 三轴平均标准差
+            jitter.append(float(arr.std(axis=0).mean()))  # mean standard deviation over the three axes
             obs.append(len(pts))
             identifiers.append(pid)
 
@@ -98,14 +102,15 @@ class MetricReconstructor:
 
     @staticmethod
     def _scale_confidence(obs, jitter, multi, stable):
-        """综合置信度 0~1：多帧跟踪占比 × 稳定占比，并对抖动做软惩罚。"""
+        """Aggregate confidence 0~1: multi-frame tracking ratio × stable ratio,
+        with a soft penalty for jitter."""
         if len(obs) == 0:
             return 0.0
         multi_ratio = multi.mean()
         if multi_ratio <= 0:
             return 0.0
         stable_ratio = (multi & stable).sum() / max(multi.sum(), 1)
-        # 抖动惩罚：平均抖动越小越接近 1
+        # Jitter penalty: closer to 1 when mean jitter is smaller
         mean_j = jitter[multi].mean() if multi.any() else 1.0
-        jitter_penalty = float(np.exp(-mean_j / 0.02))   # 20mm 处 ~0.37，2mm 处 ~0.95
+        jitter_penalty = float(np.exp(-mean_j / 0.02))   # ~0.37 at 20 mm, ~0.95 at 2 mm
         return float(np.clip(multi_ratio * (0.5 * stable_ratio + 0.5 * jitter_penalty), 0, 1))

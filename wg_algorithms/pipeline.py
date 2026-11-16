@@ -2,12 +2,12 @@
 pipeline.py — end-to-end measurement pipeline and controlled curvature experiment
 =================================================
 
-Step1 采集数据加载（wg_ar_loader）
-Step2 伤口分割（模块三前半段，可插拔）
-Step3 尺度恢复（模块一 -> 度量点云 + 置信度）
-Step4 曲率先验建模（模块二 -> 部位参数曲面）
-Step5 三维曲面积分（模块三后半段 -> 真实面积）
-Step6 多帧融合（辅助 -> 多参考帧取中位/平均）
+Step 1: capture data loading (wg_ar_loader)
+Step 2: wound segmentation (first half of module 3, pluggable)
+Step 3: scale recovery (module 1 -> metric point cloud + confidence)
+Step 4: curvature prior modelling (module 2 -> anatomical parametric surface)
+Step 5: 3D surface integration (second half of module 3 -> true area)
+Step 6: multi-frame fusion (auxiliary -> median/mean over multiple reference frames)
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import os
 import sys
 import numpy as np
 
-# 允许直接以脚本方式运行
+# Allow running directly as a script
 _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
@@ -30,10 +30,12 @@ from wg_algorithms.surface_area import recommended_normal_sigma  # noqa: E402
 
 
 def _auto_normal_sigma(K, depth, mask, target_mm: float = 6.0) -> float:
-    """按当前帧的实际深度，自动换算法向平滑 sigma。
+    """Automatically compute the normal-smoothing sigma from the current frame's
+    actual depth.
 
-    写死像素值在不同设备上会失真：iPhone LiDAR 的点间距和 WoundsDB 点云
-    差好几倍。这里统一换算成"约 target_mm 毫米的物理尺度"。
+    Hardcoded pixel values distort results across devices: the point spacing of
+    iPhone LiDAR and WoundsDB point clouds differs by several times. Here we
+    uniformly convert to "a physical scale of about target_mm millimetres".
     """
     if depth is None or mask is None:
         return 0.0
@@ -62,7 +64,8 @@ def _n_points(fr):
 
 
 def _best_reference_frame(frames):
-    """选特征点最多的一帧作为参考帧（跟踪质量最好）。"""
+    """Select the frame with the most feature points as the reference frame
+    (best tracking quality)."""
     best_i, best_n = 0, -1
     for i, fr in enumerate(frames):
         n = _n_points(fr)
@@ -73,19 +76,20 @@ def _best_reference_frame(frames):
 
 def run_pipeline(session_dir, part_type: str = "auto", segmenter=None,
                  max_frames: int = 60, lidar: bool = True):
-    """在一段采集会话上跑通完整链路。返回结果 dict。
+    """Run the full chain on one capture session. Returns a result dict.
 
-    lidar: True（默认）表示若会话含 LiDAR 深度则自动走深度主路径；
-           设为 False 可强制使用 model（无深度）路径，用于消融对比。
+    lidar: True (default) means automatically use the depth primary path if the
+           session contains LiDAR depth; set to False to force the model
+           (no-depth) path, for ablation comparisons.
     """
     sys.path.insert(0, os.path.join(_PARENT, "tools"))
     import wg_ar_loader
 
     frames, meta = _load_frames(session_dir, wg_ar_loader, max_frames)
     if not frames:
-        raise RuntimeError("未加载到任何帧")
+        raise RuntimeError("No frames were loaded")
 
-    # Step2 分割
+    # Step 2: segmentation
     seg = segmenter or SyntheticWoundSegmenter()
     ref_i = _best_reference_frame(frames)
     ref = frames[ref_i]
@@ -96,19 +100,22 @@ def run_pipeline(session_dir, part_type: str = "auto", segmenter=None,
         rgb = np.zeros((res["height"], res["width"], 3), np.uint8)
     mask, seg_info = seg.segment(rgb)
 
-    # Step3 尺度恢复
+    # Step 3: scale recovery
     recon = MetricReconstructor().reconstruct(frames)
 
-    # Step4 曲率先验建模
+    # Step 4: curvature prior modelling
     if part_type == "auto":
-        # 优先用 ARKit 平面分类决定 flat，否则默认 limb
+        # Prefer ARKit plane classification to decide "flat", otherwise default
+        # to limb
         cls = _dominant_plane_class(frames)
         part_type = "flat" if cls in ("table", "floor", "wall") else "limb_forearm"
-    # 用参考帧自身特征点拟合曲面（保证位于相机前方、贴合本帧实际看到的表面）
-    # 优先用「伤口邻域特征点」局部拟合（更稳），不足则全局
+    # Fit the surface using the reference frame's own feature points (ensures it
+    # lies in front of the camera and matches the surface actually seen in this
+    # frame); prefer local fitting with "wound-neighbourhood feature points"
+    # (more stable), falling back to global if insufficient
     model, fit_mode = _fit_model_localized(ref, part_type, mask)
 
-    # Step5 三维曲面积分
+    # Step 5: 3D surface integration
     K = intrinsics_to_K(*ref["intrinsics"])
     M = camera_transform_to_cam2world(ref["camera_transform"])
     integrator = SurfaceAreaIntegrator()
@@ -116,17 +123,21 @@ def run_pipeline(session_dir, part_type: str = "auto", segmenter=None,
     has_depth = (ref.get("depth") is not None) and lidar
     area_detail = {"primary_method": "model" if not has_depth else "lidar"}
     if has_depth:
-        # LiDAR 主路径：逐像素深度 -> 反投影 -> 基于深度图真实法向的曲面积分
-        # normal_smooth_sigma：先用「物理尺度」换算出的 sigma 平滑深度再求法向。
-        # 真实人体点云标定（tools/validate_real_surface.py）显示这一步把
-        # 面积误差从 21.7% 降到 7.3% —— 不平滑时微观噪声会把法向打歪、面积系统性虚高。
+        # LiDAR primary path: per-pixel depth -> back-projection -> surface
+        # integration using true depth-derived normals
+        # normal_smooth_sigma: smooth depth with a sigma converted from a
+        # "physical scale" before computing normals. Calibration on a real human
+        # point cloud (tools/validate_real_surface.py) shows this step reduces
+        # the area error from 21.7% to 7.3% — without smoothing, micro-noise
+        # tilts normals and systematically inflates area.
         conf = ref.get("confidence")
         sig = _auto_normal_sigma(K, ref["depth"], mask)
         area_lidar = integrator.integrate(
             rgb, mask, K, M, ("lidar", ref["depth"]), confidence=conf,
             normal_smooth_sigma=sig,
         )
-        # 同时跑 model 路径（无深度退化路径）做对照，直接量化 LiDAR 带来的差异（瓶颈#3）
+        # Also run the model path (the no-depth fallback) as a control to
+        # directly quantify the difference made by LiDAR (bottleneck #3)
         area_model = integrator.integrate(rgb, mask, K, M, ("model", model))
         area = area_lidar
         area_detail.update({
@@ -140,7 +151,8 @@ def run_pipeline(session_dir, part_type: str = "auto", segmenter=None,
         area = integrator.integrate(rgb, mask, K, M, ("model", model))
         area_detail["model_baseline"] = _area_summary(area)
 
-    # Step6 多帧融合（取质量最好的若干参考帧，优先用含深度帧）
+    # Step 6: multi-frame fusion (take the best-quality reference frames,
+    # preferring those with depth)
     multi = _multiframe_area(frames, seg, model, K)
 
     return {
@@ -154,7 +166,7 @@ def run_pipeline(session_dir, part_type: str = "auto", segmenter=None,
         "scale_recovery": recon["stats"],
         "has_depth": has_depth,
         "area": _area_summary(area),
-        "_area_full": area,   # 含 points3d（仅用于可视化，不入报告）
+        "_area_full": area,   # includes points3d (for visualisation only, not in the report)
         "area_detail": area_detail,
         "multiframe_median_cm2": multi["median_cm2"],
         "multiframe_std_cm2": multi["std_cm2"],
@@ -181,11 +193,14 @@ def _dominant_plane_class(frames):
 
 
 def _fit_model_localized(ref, part_type, mask, pad_px: int = 60):
-    """利用新增的特征点 2D 像素坐标，把曲面模型拟合限定到伤口邻域（瓶颈#4 修复）。
+    """Use the added 2D pixel coordinates of feature points to restrict surface
+    model fitting to the wound neighbourhood (bottleneck #4 fix).
 
-    对「无 LiDAR（model）路径」尤其重要：全局 PCA 在不干净点云上会抖，而伤口周围的
-    特征点都位于同一身体曲面，用它们拟合局部曲面比全局更稳、更贴合本帧实际看到的表面。
-    若邻域点不足则退化为全局拟合。
+    This is especially important for the "no-LiDAR (model) path": global PCA
+    jitters on noisy point clouds, whereas feature points around the wound all
+    lie on the same body surface, so fitting a local surface with them is more
+    stable and better matches the surface actually seen in this frame. Falls
+    back to global fitting if there are too few neighbourhood points.
     """
     pts = ref.get("feature_points")
     pix = ref.get("feature_point_pixels")
@@ -200,7 +215,7 @@ def _fit_model_localized(ref, part_type, mask, pad_px: int = 60):
     miny, maxy = ys.min() - pad_px, ys.max() + pad_px
     pix = np.asarray(pix, dtype=float)
     sel = (pix[:, 0] >= minx) & (pix[:, 0] <= maxx) & (pix[:, 1] >= miny) & (pix[:, 1] <= maxy)
-    sel &= (pix[:, 0] >= 0) & (pix[:, 1] >= 0)   # 排除 [-1,-1] 无效点
+    sel &= (pix[:, 0] >= 0) & (pix[:, 1] >= 0)   # exclude invalid [-1,-1] points
     local = np.asarray(pts, dtype=float)[sel]
     if len(local) >= 10:
         return fit_model_to_cloud(local, part_type=part_type), f"local(n={len(local)})"
@@ -219,13 +234,17 @@ def _model_params(model):
 
 
 def _multiframe_area(frames, seg, model, K, n_refs: int = 5):
-    """辅助模块：在跟踪稳定的若干帧上分别积分，取中位数（多帧时序融合）。
+    """Auxiliary module: integrate separately over several tracking-stable frames
+    and take the median (temporal multi-frame fusion).
 
-    含深度帧优先走 LiDAR 路径，无深度帧退化为 model 路径，使融合结果在
-    LiDAR 会话上更稳定（瓶颈#4：无 LiDAR 时拟合不稳的问题被深度直接规避）。
+    Frames with depth preferentially use the LiDAR path, while frames without
+    depth fall back to the model path, making the fused result more stable on
+    LiDAR sessions (bottleneck #4: the unstable fitting without LiDAR is directly
+    avoided by using depth).
     """
     integrator = SurfaceAreaIntegrator()
-    # 选「特征点最多」且「优先含深度」的 n_refs 帧
+    # Select the n_refs frames with "the most feature points" and "preference for
+    # those with depth"
     def _score(i):
         fr = frames[i]
         return (_n_points(fr), 1 if fr.get("depth") is not None else 0)
@@ -261,12 +280,15 @@ def _multiframe_area(frames, seg, model, K, n_refs: int = 5):
 def curvature_compensation_study(session_dir, part_type: str = "limb_forearm",
                                  radius_m: float = 0.04, max_frames: int = 30,
                                  wound_radius_px: float = 120, distance_m: float = 0.30):
-    """受控实验：同一枚合成伤口，在平面 vs 圆柱（肢体）曲面上对比面积。
+    """Controlled experiment: compare the area of the same synthetic wound on a
+    plane versus a cylindrical (limb) surface.
 
-    构造可复现场景（相机在原点看向 +Z），直接量化模块二「曲率先验补偿」
-    对结果的影响，输出真实数字（非估算）。
-      - 平面：位于 z=distance，法向 +Z（无曲率，补偿比≈1）
-      - 圆柱（肢体）：轴沿 X，中心 (0,0,distance)，半径 radius_m（相机看到曲面侧）
+    Construct a reproducible scene (camera at the origin looking toward +Z) to
+    directly quantify the effect of module 2's "curvature prior compensation" on
+    the result, outputting real numbers (not estimates).
+      - plane: at z=distance, normal +Z (no curvature, compensation ratio ≈1)
+      - cylinder (limb): axis along X, centre (0,0,distance), radius radius_m
+        (the camera sees the curved side)
     """
     sys.path.insert(0, os.path.join(_PARENT, "tools"))
     import wg_ar_loader
@@ -275,9 +297,9 @@ def curvature_compensation_study(session_dir, part_type: str = "limb_forearm",
     K = intrinsics_to_K(*ref["intrinsics"])
     H, W = ref["metadata"]["imageResolution"]["height"], ref["metadata"]["imageResolution"]["width"]
 
-    # 受控场景：相机在原点，cam2world = I
+    # Controlled scene: camera at the origin, cam2world = I
     M = np.eye(4)
-    # 合成圆形伤口掩膜（图像中心）
+    # Synthetic circular wound mask (image centre)
     yy, xx = np.mgrid[0:H, 0:W]
     cx, cy = W // 2, H // 2
     mask = (((xx - cx) / wound_radius_px) ** 2 + ((yy - cy) / wound_radius_px) ** 2 <= 1).astype(np.uint8) * 255
@@ -286,14 +308,16 @@ def curvature_compensation_study(session_dir, part_type: str = "limb_forearm",
 
     from wg_algorithms.curvature_prior import PlaneModel, CylinderModel
     integrator = SurfaceAreaIntegrator()
-    # 平面参考面位于 z=distance（法向 +Z，正对相机，无曲率）
+    # Planar reference surface at z=distance (normal +Z, facing the camera, no
+    # curvature)
     plane = PlaneModel([0, 0, distance_m], [0, 0, 1])
     flat = integrator.integrate(np.zeros((H, W, 3), np.uint8), mask, K, M, ("model", plane))
 
     if part_type == "flat":
         curved = flat
     else:
-        # 圆柱最近点与平面同深度（中心 z = distance + R），使对比仅反映曲率
+        # The nearest point of the cylinder has the same depth as the plane
+        # (centre z = distance + R), so the comparison reflects only curvature
         cyl = CylinderModel([0, 0, distance_m + radius_m], [1, 0, 0], radius_m)
         curved = integrator.integrate(np.zeros((H, W, 3), np.uint8), mask, K, M, ("model", cyl))
 

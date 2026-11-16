@@ -3,20 +3,20 @@
 evaluate.py — segmentation evaluation CLI with an optional area-chain check
 ===================================================
 
-用法（合成验证集，与 train 同分布不同种子）:
+Usage (synthetic validation set, same distribution as train but a different seed):
     python -m wg_train.evaluate --model runs/exp1/best.pt --synthetic 60 --out runs/exp1/eval
 
-用法（真实验证集）:
+Usage (real validation set):
     python -m wg_train.evaluate --model runs/exp1/best.pt \
         --image_dir data/val_images --mask_dir data/val_masks
 
 Optional area-chain check (predicted mask -> curved-surface area):
     ... --area_demo
 
-输出:
-    <out>/metrics.json        逐项指标均值
-    <out>/samples_*.png       预测/真值叠加可视化（最多 8 张）
-    <out>/area_demo.json      面积链路 demo 结果（若启用）
+Output:
+    <out>/metrics.json        per-metric means
+    <out>/samples_*.png       prediction/ground-truth overlay visualizations (up to 8 images)
+    <out>/area_demo.json      area-chain demo results (if enabled)
 """
 from __future__ import annotations
 
@@ -33,11 +33,11 @@ from wg_algorithms.seg_model import load_wound_model, predict_proba, HAS_TORCH
 
 
 def _json_safe(obj):
-    """把 inf/nan 转成 null。
+    """Convert inf/nan to null.
 
-    为什么要单独处理：Python 的 json.dump 默认会写出 `Infinity` / `NaN` 这种
-    **非标准 JSON** 字面量，其他语言的解析器读到会直接报错。
-    HD95 在出现完全漏检时会是 inf，所以这一步是必需的。
+    Why this is needed: Python's json.dump by default writes `Infinity` / `NaN`, which are
+    **non-standard JSON** literals that parsers in other languages reject outright.
+    HD95 becomes inf on a complete miss, so this step is necessary.
     """
     import math
     if isinstance(obj, dict):
@@ -77,8 +77,8 @@ def _save_overlay(path, rgb, pred, gt):
 
 
 def area_demo(model, device, img_size: int = 256, distance: float = 0.30, fx: float = 1500.0):
-    """验证「真实模型掩膜 -> 三维曲面面积」端到端：合成一枚伤口，模型预测掩膜，
-    在已知平面（距离 D）上用 SurfaceAreaIntegrator 计算真实面积，与 GT 掩膜面积对照。"""
+    """Validate "real model mask -> 3D surface area" end-to-end: synthesize a wound, predict its mask with the model,
+    then use SurfaceAreaIntegrator on a known plane (at distance D) to compute the real area and compare it with the GT mask area."""
     from wg_algorithms.segmentation import _keep_largest_cc
     from wg_algorithms.geometry import intrinsics_to_K
     from wg_algorithms.curvature_prior import PlaneModel
@@ -111,12 +111,13 @@ def area_demo(model, device, img_size: int = 256, distance: float = 0.30, fx: fl
 
 
 def _forward_proba(model, x, tta: bool = False):
-    """前向得到概率图 [H,W]。
+    """Forward pass to obtain the probability map [H,W].
 
-    tta=True 时做「水平+垂直翻转」三次前向取均值。
-    为什么值得做：这不需要重新训练，代价只有 3× 推理时间，
-    对边界抖动敏感的小目标（本项目创面中位只占画面 6.8%）通常能稳定涨一点 dice，
-    而且面积是从掩膜像素积分来的，边界稳一点直接等于面积误差小一点。
+    With tta=True, average three forward passes ("horizontal + vertical flips" + original).
+    Why it is worth doing: it needs no retraining and costs only 3× inference time,
+    and for small targets sensitive to boundary jitter (in this project the wound median occupies only 6.8% of the frame)
+    it usually gives a small, stable dice gain;
+    moreover, since the area is integrated from mask pixels, a steadier boundary directly means a smaller area error.
     """
     import torch
     with torch.no_grad():
@@ -124,39 +125,39 @@ def _forward_proba(model, x, tta: bool = False):
         if not tta:
             return p
         ps = [p]
-        for dim in (3, 2):                       # 3=W 翻转, 2=H 翻转
+        for dim in (3, 2):                       # 3=W flip, 2=H flip
             pf = model(torch.flip(x, [dim]))[0, 0]
-            ps.append(torch.flip(pf, [dim - 2]))  # 翻回原朝向再平均
+            ps.append(torch.flip(pf, [dim - 2]))  # flip back to the original orientation before averaging
         return torch.stack(ps).mean(dim=0)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="best.pt / last.pt 路径")
-    ap.add_argument("--synthetic", type=int, default=0, help="合成验证集样本数（与 train 不同种子）")
+    ap.add_argument("--model", required=True, help="Path to best.pt / last.pt")
+    ap.add_argument("--synthetic", type=int, default=0, help="Number of synthetic validation samples (different seed from train)")
     ap.add_argument("--image_dir", default=None)
     ap.add_argument("--mask_dir", default=None)
     ap.add_argument("--img_size", type=int, default=256)
-    ap.add_argument("--seed", type=int, default=1000, help="合成验证集随机种子（避开训练 seed）")
+    ap.add_argument("--seed", type=int, default=1000, help="Random seed for the synthetic validation set (avoid the training seed)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--out", default="runs/exp1/eval")
-    ap.add_argument("--area_demo", action="store_true", help="额外运行面积链路 demo")
+    ap.add_argument("--area_demo", action="store_true", help="Also run the area-chain demo")
     ap.add_argument("--no_largest_cc", action="store_true",
-                    help="关闭「只保留最大连通域」后处理（多发病灶的验证集请开启）")
-    ap.add_argument("--tta", action="store_true", help="翻转测试时增强（水平+垂直，概率图平均）")
-    ap.add_argument("--thr", type=float, default=0.5, help="二值化阈值（默认 0.5）")
+                    help="Disable the 'keep only the largest connected component' postprocessing (enable this for validation sets with multiple lesions)")
+    ap.add_argument("--tta", action="store_true", help="Flip test-time augmentation (horizontal + vertical, probability maps averaged)")
+    ap.add_argument("--thr", type=float, default=0.5, help="Binarization threshold (default 0.5)")
     ap.add_argument("--tune_thr", action="store_true",
-                    help="在本集上搜索最优阈值 ⚠️ 只能在【验证集】上做，"
-                         "在测试集上寻优等于把测试集信息泄漏进评估")
+                    help="Search for the optimal threshold on this set ⚠️ only do this on the [validation set]; "
+                         "tuning on the test set leaks test-set information into the evaluation")
     args = ap.parse_args()
 
     if not HAS_TORCH:
-        print("❌ 评估需要 torch；请先 `pip install torch`。")
+        print("❌ Evaluation requires torch; please run `pip install torch` first.")
         sys.exit(1)
 
     device = _auto_device(args.device)
     model = load_wound_model(args.model, device=device)
-    print(f"▶ 评估模型: {args.model} | 设备: {device}")
+    print(f"▶ evaluating model: {args.model} | device: {device}")
 
     from torch.utils.data import DataLoader
     from wg_train.dataset import ImageMaskDataset, SyntheticSegDataset
@@ -177,7 +178,7 @@ def main():
     if not args.no_largest_cc:
         from wg_algorithms.segmentation import _keep_largest_cc as keep_cc
 
-    # 先收集概率图：阈值寻优需要同一批预测在不同阈值下重算，不能一边推理一边定阈值
+    # Collect probability maps first: threshold tuning needs the same predictions recomputed at different thresholds; you cannot pick the threshold while inferring
     probas, gts_raw, rgbs = [], [], []
     for i, batch in enumerate(ld):
         x = batch["image"].to(device)
@@ -189,8 +190,8 @@ def main():
         n_save += 1
 
     def _thr_metrics(thr: float, cheap: bool = False):
-        """cheap=True 只算 dice —— 阈值寻优要扫 19 个阈值，
-        全套指标里的 HD95/boundary-F1 太慢，没必要在这里付这份代价。"""
+        """cheap=True computes only dice — threshold tuning sweeps 19 thresholds,
+        and the full metric suite's HD95/boundary-F1 is too slow to be worth paying for here."""
         ps, gs = [], []
         for pb, gt in zip(probas, gts_raw):
             pred = (pb >= thr).astype(np.uint8) * 255
@@ -206,15 +207,15 @@ def main():
     if args.tune_thr:
         best = (-1.0, args.thr, None)
         sweep = [round(0.05 * k, 2) for k in range(1, 20)]
-        print("  阈值寻优中（本集，仅 dice 准则）…")
+        print("  Tuning threshold (this set, dice criterion only)…")
         for t in sweep:
             d = _thr_metrics(t, cheap=True)[2]["dice"]
             if d > best[0]:
                 best = (d, t, None)
         thr = best[1]
-        print(f"  最优阈值 {thr:.2f}（dice {best[0]:.4f}），"
-              f"默认 0.5 对照：{_thr_metrics(0.5, cheap=True)[2]['dice']:.4f}")
-        print("  ⚠️ 该阈值只在验证集上取，评估测试集时请用 --thr 显式传入")
+        print(f"  Optimal threshold {thr:.2f} (dice {best[0]:.4f}), "
+              f"vs. default 0.5: {_thr_metrics(0.5, cheap=True)[2]['dice']:.4f}")
+        print("  ⚠️ This threshold was selected on the validation set; when evaluating the test set, pass it explicitly via --thr")
 
     preds, gts, metrics = _thr_metrics(thr)
     metrics["threshold"] = thr
@@ -226,24 +227,24 @@ def main():
     with open(os.path.join(args.out, "metrics.json"), "w") as f:
         json.dump(_json_safe(metrics), f, indent=2)
     print("\n" + "=" * 56)
-    print("评估指标（验证集均值）")
+    print("Evaluation metrics (validation-set means)")
     print("=" * 56)
     for k, v in metrics.items():
         print(f"  {k:>12}: {v}")
-    print(f"\n✅ 指标已写入 {os.path.join(args.out, 'metrics.json')}")
+    print(f"\n✅ Metrics written to {os.path.join(args.out, 'metrics.json')}")
 
     if args.area_demo:
         demo = area_demo(model, device, img_size=args.img_size)
         with open(os.path.join(args.out, "area_demo.json"), "w") as f:
             json.dump(demo, f, indent=2)
         print("\n" + "=" * 56)
-        print("面积链路 demo（合成伤口 @ 平面距离 %.2f m）" % demo["distance_m"])
+        print("Area-chain demo (synthetic wound @ plane distance %.2f m)" % demo["distance_m"])
         print("=" * 56)
-        print(f"  GT 掩膜面积   : {demo['gt_area_cm2']:.2f} cm²  (像素 {demo['gt_px']})")
-        print(f"  模型预测面积 : {demo['pred_area_cm2']:.2f} cm²  (像素 {demo['pred_px']})")
-        print(f"  相对误差     : {demo['rel_err_pct']:.2f}%")
-        print(f"  → 真实模型掩膜已驱动三维面积计算；误差主要来自分割边界与假设平面。")
-        print(f"✅ 面积 demo 已写入 {os.path.join(args.out, 'area_demo.json')}")
+        print(f"  GT mask area       : {demo['gt_area_cm2']:.2f} cm²  (pixels {demo['gt_px']})")
+        print(f"  predicted area     : {demo['pred_area_cm2']:.2f} cm²  (pixels {demo['pred_px']})")
+        print(f"  relative error     : {demo['rel_err_pct']:.2f}%")
+        print(f"  → The real model mask drove the 3D area computation; the error mainly comes from the segmentation boundary and the assumed plane.")
+        print(f"✅ Area demo written to {os.path.join(args.out, 'area_demo.json')}")
 
 
 if __name__ == "__main__":

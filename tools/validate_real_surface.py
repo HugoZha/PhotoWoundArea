@@ -2,28 +2,33 @@
 # -*- coding: utf-8 -*-
 """validate_real_surface.py — validate the surface-area integrator on real skin point clouds.
 
-背景（为什么这一步重要）：
-    此前我们所有三维面积验证都是**合成几何**（平面/圆柱/球面）。那些实验能证明公式
-    数学上没写错，但证明不了它对**真实皮肤**有效——真皮肤有褶皱、弧度不规则、
-    溃疡边缘还有陡坎。公开数据里能同时提供「三维点云 + 专家掩膜」的资源极少，
-    WoundsDB 是其中一个：它的每个 scene 都带 stereo-mesh.ply / depth-mesh.ply，
-    是**按相机网格排列的结构化点云**，xyz 单位是毫米。
+Background (why this step matters):
+    All our previous 3D area validations used **synthetic geometry** (plane/cylinder/sphere).
+    Those experiments show the formula is not mathematically wrong, but cannot show that it
+    works on **real skin** — real skin has creases, irregular curvature, and steep steps at
+    ulcer edges. Public resources that provide both a "3D point cloud + expert mask" are
+    extremely rare; WoundsDB is one of them: each of its scenes comes with stereo-mesh.ply /
+    depth-mesh.ply, which is a **structured point cloud arranged on a camera grid**, with xyz
+    in millimetres.
 
-做法（不需要掩膜就能验证）：
-    1. 点云本身就可以当作一台 pinhole 相机看到的深度图：网格坐标 (row,col) 就是像素，
-       每个像素有真实的 3D 点。用最小二乘从 x=(u-cx)·z/fx 反解出这台虚拟相机的内参
-       fx, fy, cx, cy —— 这样我们**不依赖任何外部标定**就能自洽地建立成像模型。
-    2. 在点云上取一块圆形区域（半径 R 毫米，按三维距离而不是像素距离取，
-       所以它在真实曲面上≈一个圆盘），
-    3. 真实面积 = 把这块区域的三维点做三角剖分后求和（Ground Truth），
-    4. 我们的算法 = SurfaceAreaIntegrator 走 'lidar' 分支，
-       喂同一个虚拟相机的 K 和同一份深度图，算出来的面积，
-    5. 对比两者的相对误差。
+Approach (validation without needing a mask):
+    1. The point cloud itself can be treated as a depth map seen by a pinhole camera: the grid
+       coordinates (row, col) are the pixels, and each pixel has a real 3D point. We solve for
+       the virtual camera's intrinsics fx, fy, cx, cy by least squares from x=(u-cx)·z/fx —
+       this way we build a self-consistent imaging model **without relying on any external
+       calibration**.
+    2. Take a circular region on the point cloud (radius R millimetres, measured by 3D
+       distance rather than pixel distance, so on the real surface it is ≈ a disk),
+    3. True area = triangulate the 3D points of this region and sum them (Ground Truth),
+    4. Our algorithm = SurfaceAreaIntegrator taking the 'lidar' branch, fed the same virtual
+       camera's K and the same depth map, producing an area,
+    5. Compare the relative error between the two.
 
-这一步验证的是「同一份真实几何，我们的公式能不能算回它的面积」，
-**不含分割误差** —— 分割误差是另一回事（见 analyze_area_vs_dice.py）。
+What this validates is "given the same real geometry, can our formula recover its area",
+**excluding segmentation error** — segmentation error is a separate matter (see
+analyze_area_vs_dice.py).
 
-用法：
+Usage:
     python tools/validate_real_surface.py --root data/raw/woundsdb/results --scenes 6 \
         --patches 8 --radius_mm 15
 """
@@ -46,7 +51,7 @@ from wg_algorithms.geometry import intrinsics_to_K
 from wg_algorithms.surface_area import SurfaceAreaIntegrator
 
 
-# ------------------------------------------------------------------ PLY 读取
+# ------------------------------------------------------------------ PLY reading
 def read_ply_grid(path: str, shape):
     """Read a WoundsDB binary_little_endian PLY into xyz (mm) and rgb grids.
 
@@ -62,7 +67,7 @@ def read_ply_grid(path: str, shape):
     nv = int([l for l in lines if l.startswith("element vertex")][0].split()[-1])
     h, w = shape
     if h * w != nv:
-        raise ValueError(f"{path}: {nv} 个点与 {h}x{w} 不符")
+        raise ValueError(f"{path}: {nv} points do not match {h}x{w}")
     dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
                    ("r", "u1"), ("g", "u1"), ("b", "u1")])
     with open(path, "rb") as f:
@@ -139,26 +144,29 @@ def triangle_area_over_region(xyz, keep, max_gap_mm: float = 0.0):
     a2 = np.linalg.norm(np.cross(p11 - p10, p01 - p10), axis=2)
     cell = 0.5 * (a1 + a2)                            # (H-1,W-1)
     area = float((cell * wgt[:, :, 0]).sum())
-    # 有效格数 / 本应覆盖的格数 —— 覆盖率低的区域说明点云本身质量差，
-    # 这时"部分计数"会让真值严重偏低（实测出现"真值 < 投影面积"这种几何不可能的结果），
-    # 正确做法是整块丢弃而不是硬凑。
+    # Valid cells / cells that should be covered — low coverage means the point cloud itself
+    # is of poor quality; in that case "partial counting" makes the ground truth severely too
+    # low (we have observed the geometrically impossible "ground truth < projected area"),
+    # and the correct action is to discard the whole patch rather than force a value.
     expect = max(float((0.25 * (k[:-1, :-1] + k[1:, :-1] + k[:-1, 1:]
                                 + k[1:, 1:])[:, :, 0]).sum()), 1e-9)
     return area, float(wgt[:, :, 0].sum() / expect)
 
 
 def nominal_spacing(xyz) -> float:
-    """点云正常点距中位（毫米）—— 用来设定"离群点"判定阈值。"""
+    """Median of the normal point spacing of the point cloud (mm) — used to set the "outlier" threshold."""
     d = np.linalg.norm(np.diff(xyz, axis=1), axis=2)
     return float(np.median(d))
 
 
 def smooth_xyz(xyz, sigma):
-    """同尺度平滑点云本身，用来得到与之匹配的 Ground Truth。
+    """Smooth the point cloud itself at the same scale, to obtain a matching Ground Truth.
 
-    为什么 GT 也要平滑：不同尺度下"曲面面积"不是一个数——越细看面积越大
-    （皮肤微观褶皱会贡献面积）。临床要测的是**宏观**面积，
-    所以「用平滑 sigma 求法向」必须和「用同样 sigma 的曲面当真值」配对比较。
+    Why the GT must also be smoothed: at different scales "surface area" is not a single
+    number — the finer you look, the larger the area (microscopic skin creases contribute
+    area). What clinics want to measure is the **macroscopic** area, so "computing normals
+    with a smoothing sigma" must be paired with "using a surface smoothed with the same
+    sigma as the ground truth" for comparison.
     """
     if not sigma:
         return xyz
@@ -173,15 +181,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="data/raw/woundsdb/results")
-    ap.add_argument("--scenes", type=int, default=6, help="取几个 scene 做实验")
-    ap.add_argument("--patches", type=int, default=8, help="每个 scene 取几块区域")
-    ap.add_argument("--radius_mm", type=float, default=15.0, help="区域半径（毫米）")
+    ap.add_argument("--scenes", type=int, default=6, help="how many scenes to use in the experiment")
+    ap.add_argument("--patches", type=int, default=8, help="how many patches to sample per scene")
+    ap.add_argument("--radius_mm", type=float, default=15.0, help="patch radius (millimetres)")
     ap.add_argument("--cloud", default="stereo-mesh.ply",
                     choices=["stereo-mesh.ply", "depth-mesh.ply"])
     ap.add_argument("--sigmas", default="0,1,2,3,5,8",
-                    help="对比的法向平滑强度（像素）")
+                    help="normal smoothing strengths to compare (pixels)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default=None, help="结果 JSON")
+    ap.add_argument("--out", default=None, help="result JSON")
     args = ap.parse_args()
 
     shape = {"stereo-mesh.ply": (1024, 768), "depth-mesh.ply": (176, 144)}[args.cloud]
@@ -189,12 +197,12 @@ def main():
                                            "scene_*")))
     scenes = [s for s in scenes if os.path.exists(os.path.join(s, args.cloud))]
     if not scenes:
-        print(f"❌ {args.root} 下没找到含 {args.cloud} 的 scene")
+        print(f"❌ no scene containing {args.cloud} found under {args.root}")
         return 1
     scenes = scenes[: args.scenes]
     sigmas = [float(x) for x in args.sigmas.split(",") if x != ""]
-    print(f"▶ 真实曲面验证：{len(scenes)} 个 scene / {args.cloud} / "
-          f"每 scene {args.patches} 块 R={args.radius_mm}mm 区域\n")
+    print(f"▶ Real-surface validation: {len(scenes)} scenes / {args.cloud} / "
+          f"{args.patches} patches per scene, R={args.radius_mm}mm\n")
 
     rng = np.random.default_rng(args.seed)
     integ = SurfaceAreaIntegrator()
@@ -206,13 +214,13 @@ def main():
             print(f"  [!] {sdir}: {e}")
             continue
         resid, perm, Kc = align_pinhole(xyz_mm)
-        xyz_mm = xyz_mm[:, :, list(perm)]          # 摆正为标准针孔系
+        xyz_mm = xyz_mm[:, :, list(perm)]          # reorient to the standard pinhole frame
         fx, fy, cx, cy = Kc
         K = intrinsics_to_K(fx, fy, cx, cy)
-        depth_m = xyz_mm[:, :, 2] / 1000.0          # 毫米 -> 米（算法约定）
+        depth_m = xyz_mm[:, :, 2] / 1000.0          # mm -> m (algorithm convention)
         z = xyz_mm[:, :, 2]
-        M = np.eye(4)                               # 点云已在相机系，相机即原点
-        gap_max = nominal_spacing(xyz_mm) * 4.0     # 超过 4 倍正常点距的格子视为离群
+        M = np.eye(4)                               # the point cloud is already in the camera frame; the camera is at the origin
+        gap_max = nominal_spacing(xyz_mm) * 4.0     # cells with spacing above 4x the normal point spacing are treated as outliers
 
         case = re.search(r"case_(\d+)", sdir)
         day = re.search(r"day_(\d+)", sdir)
@@ -221,7 +229,7 @@ def main():
                f"day_{day.group(1) if day else '?'}__"
                f"scene_{scene.group(1) if scene else '?'}")
 
-        # ---- 先定 patch（与 sigma 无关，保证不同 sigma 比较同一块皮肤）
+        # ---- determine patches first (independent of sigma, so different sigmas compare the same skin)
         vn = z[np.isfinite(z)]
         valid = (np.isfinite(z) & (z > max(50.0, np.percentile(vn, 5)))
                  & (z < np.percentile(vn, 95)))
@@ -237,14 +245,14 @@ def main():
             if keep.sum() >= 60:
                 patches.append((cy0, cx0, keep))
         print(f"  [{si+1}/{len(scenes)}] {os.path.relpath(sdir, args.root)}  "
-              f"fx={fx:.0f} cx={cx:.0f} cy={cy:.0f} 轴序{perm} "
-              f"残差 {resid:.3f}px 深度中位 {np.median(depth_m)*1000:.0f}mm "
-              f"({len(patches)} 块)")
+              f"fx={fx:.0f} cx={cx:.0f} cy={cy:.0f} axis order {perm} "
+              f"residual {resid:.3f}px median depth {np.median(depth_m)*1000:.0f}mm "
+              f"({len(patches)} patches)")
 
         for (cy0, cx0, keep) in patches:
-            # 先用**未平滑**点云判定这块皮肤本身质量够不够好：
-            # 覆盖率不足 90% 说明此处点云有空洞/离群，直接整块跳过，
-            # 且这样各 sigma 用的是同一批 patch，比较才公平。
+            # First use the **unsmoothed** point cloud to judge whether this patch of skin is
+            # good enough: coverage below 90% means holes/outliers here, so skip the whole
+            # patch; this also ensures all sigmas use the same patches for a fair comparison.
             _, cov_raw = triangle_area_over_region(xyz_mm, keep, max_gap_mm=gap_max)
             if cov_raw < 0.9:
                 continue
@@ -270,15 +278,16 @@ def main():
                 })
 
     if not rows:
-        print("❌ 没有有效样本")
+        print("❌ no valid samples")
         return 1
 
     print("\n" + "=" * 74)
-    print(f"真实人体曲面（{args.cloud}）面积验证  "
-          f"{len({r['scene'] for r in rows})} scene / {len(rows)//max(len(sigmas),1)} 块区域")
+    print(f"Real human surface ({args.cloud}) area validation  "
+          f"{len({r['scene'] for r in rows})} scenes / "
+          f"{len(rows)//max(len(sigmas),1)} patches")
     print("=" * 74)
-    print(f"  {'法向平滑σ':>10}{'相对误差 均值':>14}{'中位':>10}{'P90':>10}{'最大':>10}"
-          f"{'补偿倍数':>10}")
+    print(f"  {'normal σ':>10}{'mean rel err':>14}{'median':>10}{'P90':>10}{'max':>10}"
+          f"{'compensation':>10}")
     for sg in sigmas:
         sub = [r for r in rows if r["sigma"] == sg]
         if not sub:
@@ -295,15 +304,15 @@ def main():
     e = np.array([r["rel_err_pct"] for r in sub])
     gt = np.array([r["gt_area_cm2"] for r in sub])
     ou = np.array([r["our_area_cm2"] for r in sub])
-    print(f"\n  最优 σ={best:g}：误差均值 {e.mean():.2f}% / 中位 {np.median(e):.2f}% "
+    print(f"\n  optimal σ={best:g}: mean error {e.mean():.2f}% / median {np.median(e):.2f}% "
           f"/ P90 {np.percentile(e, 90):.2f}%")
-    print(f"  真实面积中位 {np.median(gt):.2f} cm²（范围 {gt.min():.2f}~{gt.max():.2f}）  "
-          f"相关性 R = {np.corrcoef(gt, ou)[0, 1]:.4f}")
+    print(f"  median true area {np.median(gt):.2f} cm² (range {gt.min():.2f}~{gt.max():.2f})  "
+          f"correlation R = {np.corrcoef(gt, ou)[0, 1]:.4f}")
 
     if args.out:
         json.dump({"config": vars(args), "rows": rows},
                   open(args.out, "w"), indent=2, ensure_ascii=False)
-        print(f"\n✅ 明细 -> {args.out}")
+        print(f"\n✅ details -> {args.out}")
     return 0
 
 

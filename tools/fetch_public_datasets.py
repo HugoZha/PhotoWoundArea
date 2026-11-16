@@ -2,27 +2,29 @@
 # -*- coding: utf-8 -*-
 """Download and normalise public wound segmentation datasets.
 
-为什么单独写这个脚本：
-    公开数据集的目录结构各不相同（AZH/FUSeg/Medetec/WoundTissue），且托管分散。
-    They are normalised to the format expected by wg_train:
+Why a separate script:
+    Public datasets have different directory structures (AZH/FUSeg/Medetec/WoundTissue) and are
+    hosted in scattered places. They are normalised to the format expected by wg_train:
 
         data/public/<source>/images/*.png
         data/public/<source>/masks/*.png
         data/public/<source>/manifest.csv
 
-能力：
-    1. parallel_download — HTTP Range 多线程分片下载（单连接被限速时显著加速）
-    2. fetch_zip / fetch_github_dir — 拉取各类托管源
-    3. standardize — 配对整理 + 二值化 + manifest
-    4. audit — 数据体检（数量/分辨率/掩膜占比/空掩膜/尺寸不一致/近似重复）
+Features:
+    1. parallel_download — HTTP Range multi-threaded chunked download (a big speedup when a single
+       connection is rate-limited)
+    2. fetch_zip / fetch_github_dir — fetch from various hosting sources
+    3. standardize — pair organisation + binarization + manifest
+    4. audit — dataset checkup (count/resolution/mask fraction/empty masks/size mismatch/near-duplicates)
 
-用法：
+Usage:
     python tools/fetch_public_datasets.py --list
     python tools/fetch_public_datasets.py --source fuseg
     python tools/fetch_public_datasets.py --source all --audit
     python tools/fetch_public_datasets.py --source fuseg --conn 16 --keep_zip
 
-合规：各数据集 License 不同（见 --list），下载使用前请自行确认用途是否被允许。
+Compliance: each dataset has a different license (see --list). Before downloading and using,
+confirm for yourself that your intended use is permitted.
 """
 
 import argparse
@@ -41,36 +43,36 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(ROOT, "data", "raw")
 OUT_DIR = os.path.join(ROOT, "data", "public")
 
-# ---------------------------------------------------------------- 数据集登记
-# license 一栏务必如实标注；获取不到的写 None，不要猜测。
+# ---------------------------------------------------------------- dataset registry
+# The license field must be filled in truthfully; if it cannot be found, write None — do not guess.
 SOURCES = {
     "fuseg2021": {
-        "desc": "FUSeg / Foot Ulcer Segmentation Challenge 2021 (UWM + AZH)，1210 图 / 1010 标签",
-        "license": "CC BY-ND 4.0（禁止再分发衍生数据集，请勿二次公开）",
+        "desc": "FUSeg / Foot Ulcer Segmentation Challenge 2021 (UWM + AZH), 1210 images / 1010 labels",
+        "license": "CC BY-ND 4.0 (redistribution of derived datasets is prohibited, do not republish)",
         "size_mb": 322,
         "kind": "github_zip",
         "url": "https://codeload.github.com/uwm-bigdata/wound-segmentation/zip/refs/heads/master",
         "subdir": "data/Foot Ulcer Segmentation Challenge",
     },
     "medetec": {
-        "desc": "Medetec diabetic foot ulcer 224px（含于 FUSeg 仓库），160 对",
-        "license": "CC BY-ND 4.0（同仓库，需遵循其条款）",
+        "desc": "Medetec diabetic foot ulcer 224px (included in the FUSeg repo), 160 pairs",
+        "license": "CC BY-ND 4.0 (same repo, its terms apply)",
         "size_mb": 10,
         "kind": "github_zip",
         "url": "https://codeload.github.com/uwm-bigdata/wound-segmentation/zip/refs/heads/master",
         "subdir": "data/Medetec_foot_ulcer_224",
     },
     "azh": {
-        "desc": "AZH Wound Care Center dataset patches（含于 FUSeg 仓库，18MB zip）",
-        "license": "CC BY-ND 4.0（同仓库）",
+        "desc": "AZH Wound Care Center dataset patches (included in the FUSeg repo, 18MB zip)",
+        "license": "CC BY-ND 4.0 (same repo)",
         "size_mb": 18,
         "kind": "github_zip_inner",
         "url": "https://codeload.github.com/uwm-bigdata/wound-segmentation/zip/refs/heads/master",
         "subdir": "data/wound_dataset/azh_wound_care_center_dataset_patches.zip",
     },
     "woundtissue": {
-        "desc": "WoundTissue (arXiv 2502.10652)，6 类组织标注 -> 二值化为伤口 vs 背景",
-        "license": "见仓库 LICENSE（使用前请确认）",
+        "desc": "WoundTissue (arXiv 2502.10652), 6 tissue classes annotated -> binarized to wound vs background",
+        "license": "see the repo LICENSE (confirm before use)",
         "size_mb": 1,
         "kind": "github_api_dir",
         "url": "https://api.github.com/repos/akabircs/WoundTissue/contents",
@@ -81,9 +83,9 @@ SOURCES = {
 IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
-# ------------------------------------------------------------ 多线程分片下载
+# ------------------------------------------------------------ multi-threaded chunked download
 def _get(url, timeout=60):
-    """完整读取一个小文件（仅用于 <20MB 的 API 响应或示例图）。"""
+    """Read a small file in full (only for <20MB API responses or sample images)."""
     import urllib.request
 
     req = urllib.request.Request(url)
@@ -93,7 +95,7 @@ def _get(url, timeout=60):
 
 
 def _range_get(url, start, end, timeout=180):
-    """取 [start, end] 字节；带重试，返回 (start, bytes)。"""
+    """Fetch bytes [start, end]; with retries, returns (start, bytes)."""
     import urllib.request
 
     req = urllib.request.Request(url)
@@ -106,14 +108,15 @@ def _range_get(url, start, end, timeout=180):
                 return start, r.read()
         except Exception as e:
             last = e
-    raise RuntimeError(f"分片下载失败 bytes={start}-{end}: {last}")
+    raise RuntimeError(f"chunk download failed bytes={start}-{end}: {last}")
 
 
 def _probe_size(url, timeout=60):
-    """用 Range: bytes=0-1 探测总大小。
+    """Probe the total size with Range: bytes=0-1.
 
-    为什么不 HEAD：部分 CDN（含 GitHub codeload）对 HEAD 返回不一致的结果，
-    一旦失败就会退化成把几百 MB 一次性读进内存。
+    Why not HEAD: some CDNs (including GitHub codeload) return inconsistent
+    results for HEAD, and on failure this degrades to reading several hundred
+    MB into memory all at once.
     """
     import urllib.request
 
@@ -132,7 +135,7 @@ def _probe_size(url, timeout=60):
 
 
 def _stream_download(url, dest, timeout=180):
-    """不支持分片时的兜底：流式写盘，不做全量内存缓冲。"""
+    """Fallback when chunking is unsupported: stream to disk without full in-memory buffering."""
     import urllib.request
 
     req = urllib.request.Request(url)
@@ -149,26 +152,27 @@ def _stream_download(url, dest, timeout=180):
 
 
 def parallel_download(url, dest, conn=8, chunk_mb=8):
-    """HTTP Range 多线程分片下载，每线程按各自 offset 直接写入目标文件。
+    """HTTP Range multi-threaded chunked download, each thread writes directly to the target file
+    at its own offset.
 
-    - 先用 Range 探测总大小；探测失败 -> 单线程流式下载
-    - 所有分片逐一入队（而非只取前 conn 片），保证完整下载
-    - 支持断点：已下满的目标文件会跳过重投（由调用方判断）
+    - First probe the total size with Range; on failure -> single-threaded streaming download
+    - Enqueue every chunk one by one (not just the first conn chunks), to guarantee a full download
+    - Supports resume: an already fully downloaded target file is skipped (decided by the caller)
     """
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     size = _probe_size(url)
     if size <= 0:
-        print("   [i] 无法探测文件大小/不支持分片，单线程流式下载")
+        print("   [i] Cannot probe file size / chunking unsupported, using single-threaded streaming download")
         n = _stream_download(url, dest)
-        print(f"   ✓ 下载完成 {dest} ({n/1e6:.1f} MB)")
+        print(f"   ✓ download complete {dest} ({n/1e6:.1f} MB)")
         return n
 
     c = chunk_mb * 1024 * 1024
     starts = list(range(0, size, c))
-    print(f"   size {size/1e6:.1f} MB | {len(starts)} 片 x {chunk_mb}MB | {conn} 线程")
+    print(f"   size {size/1e6:.1f} MB | {len(starts)} chunks x {chunk_mb}MB | {conn} threads")
 
     with open(dest, "wb") as f:
-        f.truncate(size)  # 预分配；磁盘不足时会立刻失败而不是下到一半
+        f.truncate(size)  # preallocate; fail immediately if disk is insufficient, rather than halfway through
 
     done = 0
     lock = threading.Lock()
@@ -177,7 +181,7 @@ def parallel_download(url, dest, conn=8, chunk_mb=8):
         nonlocal done
         end = min(start + c - 1, size - 1)
         s, data = _range_get(url, start, end)
-        # 每个线程独立 fd，各自 seek 到自己的 offset —— 互不干扰
+        # Each thread has its own fd and seeks to its own offset — no interference
         with open(dest, "r+b") as fw:
             fw.seek(s)
             fw.write(data)
@@ -192,32 +196,33 @@ def parallel_download(url, dest, conn=8, chunk_mb=8):
 
     with ThreadPoolExecutor(max_workers=conn) as ex:
         list(ex.map(worker, starts))
-    print(f"\n   ✓ 下载完成 {dest} ({size/1e6:.1f} MB)")
+    print(f"\n   ✓ download complete {dest} ({size/1e6:.1f} MB)")
     return size
 
 
-# ------------------------------------------------------------------ 拉取逻辑
+# ------------------------------------------------------------------ fetch logic
 def _ensure_repo_zip(conn=8, keep=False):
-    """下载 uwm-bigdata/wound-segmentation 仓库 zip 并解压到 raw/。
+    """Download the uwm-bigdata/wound-segmentation repo zip and extract it to raw/.
 
-    注意：codeload.github.com **不支持 Range 请求**（无 Accept-Ranges，zip 为流式生成），
-    因此这里交回 curl 做单线程流式下载，而不是 parallel_download。
+    Note: codeload.github.com **does not support Range requests** (no Accept-Ranges,
+    the zip is generated on the fly), so we hand this back to curl for a
+    single-threaded streaming download instead of parallel_download.
     """
     url = SOURCES["fuseg2021"]["url"]
     zp = os.path.join(RAW_DIR, "wound-segmentation.zip")
     ex = os.path.join(RAW_DIR, "wound-segmentation")
     if os.path.isdir(ex):
-        print("   [i] 已解压，跳过下载")
+        print("   [i] Already extracted, skipping download")
         return ex
     if not os.path.exists(zp) or os.path.getsize(zp) < 1_000_000:
-        print(f"   下载 {url}\n   （约 340MB，不支持分片，单线程约需 10-20 分钟）")
+        print(f"   downloading {url}\n   (~340MB, chunking unsupported, single-threaded takes about 10-20 minutes)")
         import subprocess
         r = subprocess.call(["curl", "-sSL", "--retry", "3", "-A",
                              "PhotoWoundArea/1.0", "-o", zp, url])
         if r != 0 or not os.path.exists(zp) or os.path.getsize(zp) < 1_000_000:
-            raise RuntimeError(f"仓库 zip 下载失败（curl exit={r}）")
+            raise RuntimeError(f"repo zip download failed (curl exit={r})")
         print(f"   ✓ zip {os.path.getsize(zp)/1e6:.1f} MB")
-    print("   解压中 …")
+    print("   extracting …")
     with zipfile.ZipFile(zp) as z:
         z.extractall(RAW_DIR)
     inner = os.path.join(RAW_DIR, "wound-segmentation-master")
@@ -229,7 +234,7 @@ def _ensure_repo_zip(conn=8, keep=False):
 
 
 def _pairs_from_dirs(img_dir, lbl_dir):
-    """按同名（忽略扩展名）配对 image/label。"""
+    """Pair image/label by the same name (ignoring extension)."""
     if not (os.path.isdir(img_dir) and os.path.isdir(lbl_dir)):
         return []
     labels = {}
@@ -260,7 +265,7 @@ def _binarize_threshold(lbl):
     vals = np.unique(g)
     if len(vals) <= 8:
         counts = [(int((g == v).sum()), int(v)) for v in vals]
-        bg_val = max(counts)[1]          # 占比最大的颜色 = 背景
+        bg_val = max(counts)[1]          # the colour with the largest share = background
         return (g != bg_val).astype(np.uint8) * 255
     return (g > 127).astype(np.uint8) * 255
 
@@ -286,16 +291,16 @@ def _binarize_colormap(lbl, bg_colors=((0, 0, 255), (0, 0, 0)), tol=60.0):
 
 def _save_pair(img_path, lbl_path, name, img_dst, msk_dst, rows, source, split,
                strict=True, binarize=None):
-    """读图 -> 掩膜二值化 -> 保存统一格式。返回 True 表示成功。"""
+    """Read image -> binarize mask -> save in a unified format. Returns True on success."""
     try:
         img = Image.open(img_path).convert("RGB")
         lbl = Image.open(lbl_path).convert("L")
     except Exception as e:
-        print(f"   [!] 读取失败 {name}: {e}")
+        print(f"   [!] failed to read {name}: {e}")
         return False
     if img.size != lbl.size:
         if strict:
-            print(f"   [!] 尺寸不一致，跳过 {name}: {img.size} vs {lbl.size}")
+            print(f"   [!] size mismatch, skipping {name}: {img.size} vs {lbl.size}")
             return False
         lbl = lbl.resize(img.size, Image.NEAREST)
     arr = np.array(lbl)
@@ -344,7 +349,7 @@ def fetch_fuseg(conn=8, keep_zip=False):
                               dst_src, split):
                     n += 1
             total += n
-            print(f"   {dst_src}/{split}: {n} 对")
+            print(f"   {dst_src}/{split}: {n} pairs")
     return total, rows
 
 
@@ -353,13 +358,13 @@ def fetch_azh(conn=8, keep_zip=False):
     inner = os.path.join(ex, "data", "wound_dataset",
                          "azh_wound_care_center_dataset_patches.zip")
     if not os.path.exists(inner):
-        print("   [!] 仓库内未找到 azh patches zip，跳过")
+        print("   [!] azh patches zip not found in repo, skipping")
         return 0, []
     work = os.path.join(RAW_DIR, "azh")
     os.makedirs(work, exist_ok=True)
     with zipfile.ZipFile(inner) as z:
         z.extractall(work)
-    # 自动找 images/labels 配对（常见结构：*/Images/*, */Labels/* 或 */image/*,*/mask/*）
+    # Auto-find image/label pairs (common structures: */Images/*, */Labels/* or */image/*,*/mask/*)
     img_dirs, lbl_dirs = [], []
     for root, _, files in os.walk(work):
         low = root.lower()
@@ -375,7 +380,7 @@ def fetch_azh(conn=8, keep_zip=False):
     os.makedirs(msk_dst, exist_ok=True)
     n = 0
     for idir in img_dirs:
-        # 同级/兄弟目录里找 label
+        # find the label in the same or a sibling directory
         cand = None
         for ldir in lbl_dirs:
             if os.path.commonpath([idir, ldir]) and _pairs_from_dirs(idir, ldir):
@@ -387,12 +392,13 @@ def fetch_azh(conn=8, keep_zip=False):
             safe = "azh_" + nm
             if _save_pair(ip, lp, safe, img_dst, msk_dst, rows, "azh", "all"):
                 n += 1
-    print(f"   azh: {n} 对（来自 {len(img_dirs)} 个图像目录）")
+    print(f"   azh: {n} pairs (from {len(img_dirs)} image directories)")
     return n, rows
 
 
 def _get_file(url, dest, timeout=90, retries=3):
-    """下载单文件；失败时清理半成品，避免留下损坏文件被后续当成已存在。"""
+    """Download a single file; on failure clean up partial files so a corrupted file
+    is not later mistaken for an existing one."""
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         return dest
     last = None
@@ -406,15 +412,16 @@ def _get_file(url, dest, timeout=90, retries=3):
             return dest
         except Exception as e:
             last = e
-            # 清理半成品再重试
+            # clean up partial files before retrying
             for p in (dest, dest + ".tmp"):
                 if os.path.exists(p):
                     os.remove(p)
-    raise RuntimeError(f"下载失败 {url}: {last}")
+    raise RuntimeError(f"download failed {url}: {last}")
 
 
 def fetch_woundtissue(conn=8, keep_zip=False):
-    """GitHub API 列举目录并下载所有样本（该仓库仅含部分示例图）。"""
+    """List directories via the GitHub API and download all samples
+    (this repo only contains some sample images)."""
     import json
 
     rows = []
@@ -422,7 +429,8 @@ def fetch_woundtissue(conn=8, keep_zip=False):
     for d in ("image", "label"):
         data = json.loads(_get(
             f"https://api.github.com/repos/akabircs/WoundTissue/contents/{d}"))
-        # 直接用 API 返回的 download_url，天然处理了空格/括号等转义
+        # Use the download_url returned by the API directly; escaping of spaces,
+        # parentheses, etc. is handled naturally
         listing[d] = {os.path.splitext(i["name"])[0]: i["download_url"]
                       for i in data}
     img_dst = os.path.join(OUT_DIR, "woundtissue", "images")
@@ -435,34 +443,34 @@ def fetch_woundtissue(conn=8, keep_zip=False):
     for stem, iurl in listing["image"].items():
         if stem not in listing["label"]:
             continue
-        # 用 stem 做本地文件名，天然避开 image/label 同名冲突
+        # Use the stem as the local filename, naturally avoiding image/label name collisions
         ip = os.path.join(raw_img, stem + ".png")
         lp = os.path.join(raw_lbl, stem + ".png")
         try:
             _get_file(iurl, ip)
             _get_file(listing["label"][stem], lp)
         except Exception as e:
-            print(f"   [!] 跳过 {stem}: {e}")
+            print(f"   [!] skipping {stem}: {e}")
             continue
         if _save_pair(ip, lp, "wt_" + stem + ".png",
                       img_dst, msk_dst, rows, "woundtissue", "all",
                       binarize=_binarize_colormap):
             n += 1
-    print(f"   woundtissue: {n} 对")
+    print(f"   woundtissue: {n} pairs")
     return n, rows
 
 
 FETCHERS = {
     "fuseg2021": fetch_fuseg,
-    "medetec": fetch_fuseg,   # 同一个仓库，一起取
+    "medetec": fetch_fuseg,   # same repo, fetched together
     "azh": fetch_azh,
     "woundtissue": fetch_woundtissue,
 }
 
 
-# ------------------------------------------------------------------ 数据体检
+# ------------------------------------------------------------------ dataset checkup
 def audit(out_dir=OUT_DIR):
-    print("\n══ 数据体检 ══")
+    print("\n══ Dataset checkup ══")
     report = {}
     for src in sorted(os.listdir(out_dir)):
         sdir = os.path.join(out_dir, src)
@@ -475,7 +483,7 @@ def audit(out_dir=OUT_DIR):
             continue
         fr = np.array([float(r["mask_frac"]) for r in rows])
         sizes = {(int(r["w_px"]), int(r["h_px"])) for r in rows}
-        # 近似重复检测（图像 md5）
+        # near-duplicate detection (image md5)
         dups = 0
         seen = set()
         idir = os.path.join(sdir, "images")
@@ -489,31 +497,31 @@ def audit(out_dir=OUT_DIR):
         empty = int((fr == 0).sum())
         tiny = int((fr < 0.001).sum())
         print(f"\n[{src}]  n={len(rows)}")
-        print(f"  掩膜占比: mean={fr.mean()*100:.2f}%  中位={np.median(fr)*100:.2f}%  "
+        print(f"  mask fraction: mean={fr.mean()*100:.2f}%  median={np.median(fr)*100:.2f}%  "
               f"min={fr.min()*100:.3f}%  max={fr.max()*100:.2f}%")
-        print(f"  空掩膜: {empty}   近乎空(<0.1%): {tiny}   完全重复图: {dups}")
-        print(f"  分辨率种类: {len(sizes)} -> {sorted(sizes)[:4]}")
+        print(f"  empty masks: {empty}   near-empty (<0.1%): {tiny}   exact duplicates: {dups}")
+        print(f"  resolution varieties: {len(sizes)} -> {sorted(sizes)[:4]}")
         report[src] = {"n": len(rows), "empty": empty, "dup": dups,
                        "frac_mean": float(fr.mean()),
                        "frac_min": float(fr.min()), "sizes": len(sizes)}
         if empty:
-            print(f"  [!] 发现 {empty} 张空掩膜样本 —— 训练前建议剔除")
+            print(f"  [!] found {empty} empty-mask samples — recommend removing them before training")
     return report
 
 
 # ---------------------------------------------------------------------- main
 def main():
-    ap = argparse.ArgumentParser(description="下载并标准化公开伤口数据集")
+    ap = argparse.ArgumentParser(description="Download and standardize public wound datasets")
     ap.add_argument("--source", default="all",
                     help="fuseg2021 / medetec / azh / woundtissue / all")
-    ap.add_argument("--conn", type=int, default=8, help="下载并发数")
+    ap.add_argument("--conn", type=int, default=8, help="download concurrency")
     ap.add_argument("--keep_zip", action="store_true")
-    ap.add_argument("--list", action="store_true", help="列出可用数据源")
-    ap.add_argument("--audit", action="store_true", help="对已下载数据做体检")
+    ap.add_argument("--list", action="store_true", help="list available data sources")
+    ap.add_argument("--audit", action="store_true", help="run a checkup on already-downloaded data")
     args = ap.parse_args()
 
     if args.list:
-        print(f"{'源':<14}{'体量':<10}{'License':<16}说明")
+        print(f"{'source':<14}{'size':<10}{'License':<16}description")
         for k, v in SOURCES.items():
             print(f"{k:<14}{v['size_mb']:<10}{str(v['license'])[:14]:<16}{v['desc']}")
         return 0
@@ -523,7 +531,7 @@ def main():
         return 0
 
     todo = list(SOURCES) if args.source == "all" else [args.source]
-    # fuseg2021 与 medetec 同在一个仓库 zip 中，只触发一次下载解压
+    # fuseg2021 and medetec live in the same repo zip, so trigger download/extraction only once
     if "fuseg2021" in todo and "medetec" in todo:
         todo.remove("medetec")
 
@@ -533,12 +541,12 @@ def main():
         try:
             n, rows = FETCHERS[name](conn=args.conn, keep_zip=args.keep_zip)
         except Exception as e:
-            print(f"   [✗] {name} 获取失败: {e}")
+            print(f"   [✗] {name} fetch failed: {e}")
             continue
         flat_rows.extend(rows)
-        print(f"   ✓ {name} 完成 {n} 对")
+        print(f"   ✓ {name} completed {n} pairs")
 
-    # 按 row 里的 source 字段分组写 manifest（一次拉取可能包含多个源）
+    # Group by the source field in each row when writing manifests (one fetch may contain multiple sources)
     by_src = {}
     for r in flat_rows:
         by_src.setdefault(r["source"], []).append(r)
@@ -548,7 +556,7 @@ def main():
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
-        print(f"   manifest: {sdir}/manifest.csv ({len(rows)} 行)")
+        print(f"   manifest: {sdir}/manifest.csv ({len(rows)} rows)")
 
     audit()
     return 0

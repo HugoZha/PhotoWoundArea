@@ -2,21 +2,21 @@
 synth3d.py — analytic-ground-truth wound benchmark generator
 ================================================================
 
-思路：不去编造"看起来像伤口"的 2D 图，而是**模拟一次真实拍摄**：
+Approach: instead of fabricating 2D images that "look like a wound", we **simulate a real photo shoot**:
 
-    已知几何的体表曲面（平面/圆柱/球面）
-      + 伤口按弧长参数贴在曲面上（形状、大小已知）
-      + 相机以已知内参/位姿拍照（透视投影 + 曲面光照/遮挡）
-    => RGB 图 + 像素级掩膜 + 逐像素深度 + **解析真值曲面面积（cm²）**
+    A body-surface shape with known geometry (plane/cylinder/sphere)
+      + a wound attached to the surface in arclength parameters (known shape and size)
+      + a camera taking the photo with known intrinsics/pose (perspective projection + surface shading/occlusion)
+    => RGB image + pixel-level mask + per-pixel depth + **analytic ground-truth surface area (cm²)**
 
-关键点：真值面积是「伤口在三维曲面上的面积」，不是 2D 像素数。
-因此可以端到端评测「分割 -> 三维面积」的真实误差，而不只是 dice。
+Key point: the ground-truth area is the wound's area on the 3D surface, not the 2D pixel count.
+This makes it possible to evaluate the real error of "segmentation -> 3D area" end-to-end, not just dice.
 
-三条用法：
-  1) 纯程序化：伤口/皮肤纹理由代码生成（零外部依赖）；
-  2) 真实外观 + 合成几何：把公开数据集（FUSC/DFUC/Medetec 等）抠出的
-     伤口 patch 贴到曲面上（--wound_patches DIR），皮肤仍程序化；
-  3) 混合：两者按比例混合，提升外观多样性。
+Three modes of use:
+  1) Fully procedural: wound/skin textures generated in code (zero external dependencies);
+  2) Real appearance + synthetic geometry: wound patches cut out of public datasets
+     (FUSC/DFUC/Medetec, etc.) are pasted onto the surface (--patch_dir DIR), skin still procedural;
+  3) Hybrid: mix the two in a configurable ratio to increase appearance diversity.
 
 Quick run:
     python -m wg_train.synth3d --n 12 --img_size 512
@@ -36,20 +36,20 @@ from wg_algorithms.curvature_prior import (                    # noqa: E402
     PlaneModel, CylinderModel, SphereModel, PART_PRESETS,
 )
 
-# 若干档肤色（Fitzpatrick 近似），提升多样性与公平性
+# Several skin-tone levels (Fitzpatrick approximation) to improve diversity and fairness
 SKIN_TONES = np.array([
     [255, 224, 196], [234, 192, 156], [206, 160, 122], [176, 128, 92],
     [140, 96, 66], [96, 62, 40],
 ], dtype=np.float32)
 
-# 创面床基色：肉芽(红)/腐肉(黄)/坏死(黑)/渗液(亮粉)
+# Wound-bed base colours: granulation (red) / slough (yellow) / necrosis (black) / exudate (bright pink)
 WOUND_TONES = np.array([
     [214, 74, 62], [196, 104, 70], [232, 150, 90], [96, 62, 60],
     [168, 44, 52], [226, 118, 108],
 ], dtype=np.float32)
 
 
-# ---------------------------------------------------------------- 射线
+# ---------------------------------------------------------------- rays
 def camera_rays(K, W, H):
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     uu, vv = np.meshgrid(np.arange(W) + 0.5, np.arange(H) + 0.5)
@@ -58,7 +58,7 @@ def camera_rays(K, W, H):
 
 
 def intersect(dirs, model, origin=np.zeros(3)):
-    """向量化射线-曲面求交，返回 (t (H,W), hit (H,W,3), ok (H,W))。"""
+    """Vectorized ray-surface intersection, returns (t (H,W), hit (H,W,3), ok (H,W))."""
     H, W = dirs.shape[:2]
     t = np.full((H, W), np.nan)
     ok = np.zeros((H, W), bool)
@@ -85,7 +85,7 @@ def intersect(dirs, model, origin=np.zeros(3)):
     else:  # cylinder
         a = dirs[..., 0]
         e = np.array([1.0, 0.0, 0.0]) if abs(model.axis_dir[0]) > 0.9 else None
-        # 通用：去掉轴向分量
+        # General case: remove the axial component
         ax = model.axis_dir / (np.linalg.norm(model.axis_dir) + 1e-12)
         W0 = (origin - model.axis_point)
         W0p = W0 - np.dot(W0, ax) * ax
@@ -105,9 +105,9 @@ def intersect(dirs, model, origin=np.zeros(3)):
 
 
 def surface_params(hit, model):
-    """曲面点 -> (s, x) 弧长参数（米）：s 沿圆周方向，x 沿轴向/子午方向。"""
+    """Surface point -> (s, x) arclength parameters (meters): s along the circumferential direction, x along the axial/meridional direction."""
     if model.surface_kind == "plane":
-        # 平面上取两个正交切向
+        # Pick two orthogonal tangent directions on the plane
         n = model.normal
         e1 = np.cross(n, [1.0, 0, 0])
         if np.linalg.norm(e1) < 1e-6:
@@ -120,24 +120,24 @@ def surface_params(hit, model):
     if model.surface_kind == "sphere":
         rel = hit - model.center
         n = rel / (np.linalg.norm(rel, axis=-1, keepdims=True) + 1e-12)
-        # 以伤口中心方向为极点：s = 沿纬向弧长，x = 沿经向弧长
-        pole = np.array([0.0, 0.0, -1.0])          # 朝相机一侧为极点
+        # Use the wound-center direction as the pole: s = arclength along latitude, x = arclength along longitude
+        pole = np.array([0.0, 0.0, -1.0])          # the side facing the camera is the pole
         e1 = np.cross(pole, [1.0, 0, 0])
         if np.linalg.norm(e1) < 1e-6:
             e1 = np.cross(pole, [0, 1.0, 0])
         e1 /= np.linalg.norm(e1)
         e2 = np.cross(pole, e1)
-        lat = np.arcsin(np.clip(-(n @ pole), -1, 1))        # 到极点角距
+        lat = np.arcsin(np.clip(-(n @ pole), -1, 1))        # angular distance to the pole
         lon = np.arctan2(n @ e2, n @ e1)
         R = model.radius
         return R * lat * np.cos(lon), R * lat * np.sin(lon)
 
-    # cylinder：x 沿轴，s = R * θ
+    # cylinder: x along the axis, s = R * θ
     ax = model.axis_dir / (np.linalg.norm(model.axis_dir) + 1e-12)
     rel = hit - model.axis_point
     x = rel @ ax
     rad = rel - x[..., None] * ax
-    # 以「朝相机的最近母线」为 s=0
+    # Use the "nearest generator facing the camera" as s=0
     ref = np.array([0.0, 0.0, -1.0])
     ref = ref - np.dot(ref, ax) * ax
     ref /= np.linalg.norm(ref) + 1e-12
@@ -147,20 +147,20 @@ def surface_params(hit, model):
 
 
 def jacobian(s, x, model):
-    """面积元 dA = J(s,x) ds dx。"""
+    """Area element dA = J(s,x) ds dx."""
     if model.surface_kind == "plane":
         return np.ones_like(s)
     if model.surface_kind == "cylinder":
         return np.ones_like(s)
-    # 球面（测地极坐标近似）：J = sinc 形式
+    # Sphere (geodesic polar approximation): J has a sinc form
     R = model.radius
     r = np.sqrt(s ** 2 + x ** 2)
     return np.where(r < 1e-9, 1.0, np.sin(r / R) / (r / R + 1e-12))
 
 
-# ---------------------------------------------------------------- 伤口形状
+# ---------------------------------------------------------------- wound shape
 def wound_region(s, x, ra, rb, harmonics):
-    """不规则伤口区域：扰动椭圆，返回 rho（<=1 为伤口内）。"""
+    """Irregular wound region: a perturbed ellipse; returns rho (<=1 means inside the wound)."""
     ang = np.arctan2(x / max(rb, 1e-9), s / max(ra, 1e-9))
     rr = np.sqrt((s / ra) ** 2 + (x / rb) ** 2)
     pert = np.zeros_like(rr)
@@ -170,7 +170,7 @@ def wound_region(s, x, ra, rb, harmonics):
 
 
 def gt_area(ra, rb, harmonics, model, c_s=0.0, c_x=0.0, n_grid=1400):
-    """在参数域数值积分求真值曲面面积（m²）。"""
+    """Numerically integrate in parameter space to obtain the ground-truth surface area (m²)."""
     ext_s = ra * 1.35
     ext_x = rb * 1.35
     ss = np.linspace(c_s - ext_s, c_s + ext_s, n_grid)
@@ -184,7 +184,7 @@ def gt_area(ra, rb, harmonics, model, c_s=0.0, c_x=0.0, n_grid=1400):
     return float((J * inside).sum() * ds * dx)
 
 
-# ---------------------------------------------------------------- 纹理
+# ---------------------------------------------------------------- texture
 def _low_freq_noise(H, W, rng, scale=4):
     n = rng.standard_normal((max(2, H // scale), max(2, W // scale))).astype(np.float32)
     from PIL import Image
@@ -211,9 +211,9 @@ def surface_normals(hit, model):
     return rad / (np.linalg.norm(rad, axis=-1, keepdims=True) + 1e-12)
 
 
-# ---------------------------------------------------------------- 主类
+# ---------------------------------------------------------------- main class
 class SurfaceSynth:
-    """把伤口贴到已知几何曲面上渲染，产出 (RGB, 掩膜, 深度, 真值面积)。"""
+    """Attach a wound to a known-geometry surface and render it, producing (RGB, mask, depth, ground-truth area)."""
 
     def __init__(self, img_size=512, fx=None, distance_m=0.30,
                  part_type="limb_forearm", seed=0, patch_dir=None):
@@ -232,7 +232,7 @@ class SurfaceSynth:
         self.model_type, self.R = PART_PRESETS.get(part_type, ("cylinder", 0.04))
         self.part_type = part_type
 
-        # 相机：位于原点看向 +Z，曲面最近点距相机 distance
+        # Camera: at the origin looking toward +Z; the nearest surface point is at distance from the camera
         if self.model_type == "plane":
             self.model = PlaneModel([0, 0, self.distance], [0, 0, -1])
         elif self.model_type == "sphere":
@@ -242,11 +242,11 @@ class SurfaceSynth:
             R = self.R
             self.model = CylinderModel([0, 0, self.distance + R], [1, 0, 0], R)
 
-        # 内参：按常见手机 FOV 反推 fx（60° 水平 FOV）
+        # Intrinsics: derive fx from a typical phone FOV (60° horizontal FOV)
         self.fx = float(fx) if fx else (self.img_size * 0.5) / np.tan(np.deg2rad(30))
         self.K = intrinsics_to_K(self.fx, self.fx, self.img_size / 2, self.img_size / 2)
 
-    # ---------- 真实伤口 patch（可选） ----------
+    # ---------- real wound patches (optional) ----------
     def _load_patches(self):
         if self._patches is not None or not self.patch_dir:
             return self._patches
@@ -278,12 +278,12 @@ class SurfaceSynth:
         s = np.where(ok, s, np.nan)
         x = np.where(ok, x, np.nan)
 
-        # 伤口尺寸：给定面积（cm²）反推半轴，长宽比随机
+        # Wound size: infer semi-axes from the given area (cm²), with a random aspect ratio
         if wound_area_cm2 is None:
             wound_area_cm2 = float(self.rng.uniform(1.0, 30.0))
         A = wound_area_cm2 * 1e-4                       # cm² -> m²
-        ar = float(self.rng.uniform(1.15, 2.0))         # 长宽比
-        ra = np.sqrt(A * ar / np.pi)                    # 半轴（米）
+        ar = float(self.rng.uniform(1.15, 2.0))         # aspect ratio
+        ra = np.sqrt(A * ar / np.pi)                    # semi-axis (meters)
         rb = ra / ar
         harmonics = [(2, irregularity * 0.7, self.rng.uniform(0, 2 * np.pi)),
                      (3, irregularity * 0.45, self.rng.uniform(0, 2 * np.pi)),
@@ -292,7 +292,7 @@ class SurfaceSynth:
         rho = wound_region(s, x, ra, rb, harmonics)
         wmask = (rho <= 1.0) & ok
 
-        # ---- 纹理 ----
+        # ---- texture ----
         skin = SKIN_TONES[self.rng.integers(0, len(SKIN_TONES))]
         wtone = WOUND_TONES[self.rng.integers(0, len(WOUND_TONES))] if tone is None else tone
         n1 = _low_freq_noise(H, W, self.rng, scale=6)
@@ -306,7 +306,7 @@ class SurfaceSynth:
         wbase *= (0.80 + 0.40 * n2[..., None])
         wbase += (n1[..., None] - 0.5) * 14.0
 
-        # 真实伤口 patch（若提供）：在伤口区域内按参数归一化坐标采样
+        # Real wound patch (if provided): sample in normalized parameter coordinates within the wound region
         patches = self._load_patches()
         if patches:
             pim, pmk = patches[(self.patch_rng or self.rng).integers(0, len(patches))]
@@ -315,13 +315,13 @@ class SurfaceSynth:
             pmk_r = np.asarray(pmk.resize((pw, pw)), np.float32) > 127
             ys, xs = np.where(pmk_r)
             if len(xs) > 50 and wmask.any():
-                # 把伤口 patch 拉伸贴合到当前伤口的参数域包围盒
+                # Stretch the wound patch to fit the current wound's parameter-domain bounding box
                 us = np.clip(((s - (-ra * 1.2)) / (2.4 * ra) * pw).astype(int), 0, pw - 1)
                 ux = np.clip(((x - (-rb * 1.2)) / (2.4 * rb) * pw).astype(int), 0, pw - 1)
                 sel = pmk_r[ux, us]
                 wbase = np.where(sel[..., None], pim_r[ux, us], wbase)
 
-        # 边界软过渡：以 rho=1 为中心（alpha=0.5），使"可见边缘"与真值区域一致
+        # Soft boundary transition: centered at rho=1 (alpha=0.5), so the "visible edge" matches the ground-truth region
         edge_m = 0.0015
         eps = edge_m / max(ra, rb)
         alpha = np.clip((1.0 + eps - rho) / (2 * eps), 0, 1)
@@ -332,14 +332,14 @@ class SurfaceSynth:
         light = np.array([-0.35, 0.45, 0.82])
         light /= np.linalg.norm(light)
         col = _shade(col, np.nan_to_num(normals), light)
-        # 伤口湿润高光
+        # wet wound highlight
         spec = np.clip(np.nan_to_num(normals) @ light, 0, 1) ** 8
         col = col + (spec[..., None] * 40.0) * alpha
 
         rgb = np.clip(col, 0, 255).astype(np.uint8)
         rgb = np.where(ok[..., None], rgb, 0)
 
-        # 掩膜严格取 rho<=1，与 gt_area 的数值积分区域一致（避免口径偏差）
+        # Mask strictly takes rho<=1, consistent with the numerical integration region of gt_area (avoids definitional mismatch)
         mask = wmask.astype(np.uint8) * 255
 
         depth = np.where(ok, np.linalg.norm(hit, axis=-1), np.nan)
@@ -363,9 +363,9 @@ class SurfaceSynth:
 # ------------------------------------------------------- example entry point
 def run_demo(n=12, img_size=512, seed=0, part_type="limb_forearm",
              patch_dir=None, out_dir=None, model_path=None, device="auto"):
-    """生成 n 个样本，用真实算法链路估算面积，与真值对比。
+    """Generate n samples, estimate the area with the real algorithm pipeline, and compare to ground truth.
 
-    model_path: 若给出，则端到端使用训练好的 WoundSegModel；否则用色彩基线。
+    model_path: if given, use the trained WoundSegModel end-to-end; otherwise use the color baseline.
     """
     from wg_algorithms.surface_area import SurfaceAreaIntegrator
     from wg_algorithms.segmentation import ColorThresholdSegmenter
@@ -377,23 +377,23 @@ def run_demo(n=12, img_size=512, seed=0, part_type="limb_forearm",
     if model_path:
         from wg_algorithms.segmentation import WoundSegModel
         seg = WoundSegModel(weights_path=model_path, device=device, img_size=img_size)
-        seg_name = "WoundSegModel(训练)"
+        seg_name = "WoundSegModel (trained)"
     else:
         seg = ColorThresholdSegmenter()
-        seg_name = "ColorThreshold(基线)"
+        seg_name = "ColorThreshold (baseline)"
 
     rows = []
     for i in range(n):
         smp = synth.render()
         rgb, gt = smp["rgb"], smp["mask"]
         pred, _ = seg.segment(rgb)
-        # 路径 A：LiDAR（用渲染出的深度，模拟有 LiDAR 设备）
+        # Path A: LiDAR (using the rendered depth, simulating a device equipped with LiDAR)
         a_lidar = integ.integrate(rgb, gt, smp["K"], smp["M"],
                                   ("lidar", smp["depth"]))
-        # 路径 B：曲率先验（无 LiDAR，射线与参数曲面求交）
+        # Path B: curvature prior (no LiDAR; ray intersected with a parametric surface)
         a_model = integ.integrate(rgb, gt, smp["K"], smp["M"],
                                   ("model", synth.model))
-        # 路径 C：端到端（色彩基线分割出的掩膜 + 曲率先验）——最贴近真实使用
+        # Path C: end-to-end (mask from color-baseline segmentation + curvature prior) — closest to real usage
         a_pred = integ.integrate(rgb, pred, smp["K"], smp["M"],
                                  ("model", synth.model))
         g = smp["gt_area_cm2"]
@@ -413,18 +413,18 @@ def run_demo(n=12, img_size=512, seed=0, part_type="limb_forearm",
     err_e = [_err(r["e2e"], r["gt"]) for r in rows]
     dc = [r["dice"] for r in rows]
 
-    print(f"\nSynthWound sample | 部位={part_type} | 曲面={synth.model.surface_kind} "
-          f"| R={synth.R*100:.1f}cm | 样本={n}")
+    print(f"\nSynthWound sample | part={part_type} | surface={synth.model.surface_kind} "
+          f"| R={synth.R*100:.1f}cm | samples={n}")
     print("-" * 74)
-    print(f"{'GT(cm²)':>9} {'LiDAR':>9} {'曲率先验':>9} {'端到端':>9} {'dice':>7}")
+    print(f"{'GT(cm²)':>9} {'LiDAR':>9} {'curvature':>9} {'end-to-end':>9} {'dice':>7}")
     for r in rows:
         print(f"{r['gt']:9.2f} {r['lidar']:9.2f} {r['model']:9.2f} "
               f"{r['e2e']:9.2f} {r['dice']:7.3f}")
     print("-" * 74)
-    print(f"LiDAR 路径   相对误差 均值 {np.mean(err_l):6.2f}%  中位 {np.median(err_l):6.2f}%")
-    print(f"曲率先验路径 相对误差 均值 {np.mean(err_m):6.2f}%  中位 {np.median(err_m):6.2f}%")
-    print(f"端到端(含分割)相对误差 均值 {np.mean(err_e):6.2f}%  中位 {np.median(err_e):6.2f}%")
-    print(f"{seg_name} 分割 dice 均值 {np.mean(dc):.3f}")
+    print(f"LiDAR path          rel. error mean {np.mean(err_l):6.2f}%  median {np.median(err_l):6.2f}%")
+    print(f"curvature prior     rel. error mean {np.mean(err_m):6.2f}%  median {np.median(err_m):6.2f}%")
+    print(f"end-to-end (w/ seg) rel. error mean {np.mean(err_e):6.2f}%  median {np.median(err_e):6.2f}%")
+    print(f"{seg_name} segmentation dice mean {np.mean(dc):.3f}")
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -433,15 +433,15 @@ def run_demo(n=12, img_size=512, seed=0, part_type="limb_forearm",
             smp = synth.render()
             Image.fromarray(smp["rgb"]).save(os.path.join(out_dir, f"synth_{i:02d}.png"))
             Image.fromarray(smp["mask"]).save(os.path.join(out_dir, f"synth_{i:02d}_mask.png"))
-        print(f"示例已保存: {out_dir}")
+        print(f"Examples saved to: {out_dir}")
     return rows
 
 
 def dump_dataset(out_dir, n=300, img_size=384, seed=0, patch_dir=None):
-    """导出可直接喂给 wg_train.train 的数据集：images/ + masks/ + manifest.csv。
+    """Export a dataset ready to feed to wg_train.train: images/ + masks/ + manifest.csv.
 
-    部位按真实分布混合（前臂/大腿/骶尾平面/足跟球面），面积 1~30 cm²。
-    manifest.csv 额外记录每例的**真值曲面面积**，供后续面积误差评测。
+    Parts are mixed following a realistic distribution (forearm/thigh/sacral planar/heel spherical), areas 1~30 cm².
+    manifest.csv additionally records each case's **ground-truth surface area** for subsequent area-error evaluation.
     """
     import csv
     from PIL import Image
@@ -468,7 +468,7 @@ def dump_dataset(out_dir, n=300, img_size=384, seed=0, patch_dir=None):
         w = csv.DictWriter(f, fieldnames=["file", "gt_area_cm2", "part", "surface"])
         w.writeheader()
         w.writerows(rows)
-    print(f"数据集已导出: {out_dir}  (n={n}, img_size={img_size})")
+    print(f"Dataset exported: {out_dir}  (n={n}, img_size={img_size})")
     return rows
 
 
@@ -478,10 +478,10 @@ def main():
     ap.add_argument("--img_size", type=int, default=512)
     ap.add_argument("--part_type", default="limb_forearm")
     ap.add_argument("--patch_dir", default=None,
-                    help="真实伤口 patch 目录（xxx.png + xxx_mask.png），可选")
-    ap.add_argument("--out", default=None, help="示例图输出目录")
-    ap.add_argument("--model", default=None, help="训练好的模型权重（端到端评测用）")
-    ap.add_argument("--dump", default=None, help="导出数据集到该目录")
+                    help="Directory of real wound patches (xxx.png + xxx_mask.png), optional")
+    ap.add_argument("--out", default=None, help="Output directory for example images")
+    ap.add_argument("--model", default=None, help="Trained model weights (for end-to-end evaluation)")
+    ap.add_argument("--dump", default=None, help="Export the dataset to this directory")
     ap.add_argument("--dump_n", type=int, default=300)
     args = ap.parse_args()
 

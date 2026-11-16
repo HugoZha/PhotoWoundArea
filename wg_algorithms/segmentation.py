@@ -2,15 +2,20 @@
 segmentation.py — pluggable wound segmentation interface
 ====================================================
 
-提供可插拔分割接口：
-  - BaseSegmenter           统一接口 segment(rgb) -> (mask, info)
-  - ColorThresholdSegmenter 经典 CV 基线（LAB 色彩 + Otsu），用于无模型时的兜底/对照
-  - SyntheticWoundSegmenter 演示用合成伤口区域（样本数据无标注时使用，明确标注为合成）
-  - WoundSegModel           对接训练好的分割模型（WoundUNet 骨干，见 seg_model.py）
+Provides a pluggable segmentation interface:
+  - BaseSegmenter            unified interface segment(rgb) -> (mask, info)
+  - ColorThresholdSegmenter classic CV baseline (LAB colour + Otsu), used as a
+                            fallback/control when no model is available
+  - SyntheticWoundSegmenter synthetic wound region for demos (used when sample
+                            data has no annotations, explicitly marked as synthetic)
+  - WoundSegModel            wraps a trained segmentation model (WoundUNet backbone,
+                            see seg_model.py)
 
-注意：真实临床部署应使用训练好的分割模型；此处经典基线仅作工程对照与
-      pipeline 跑通，不作为精度交付口径。WoundSegModel 的权重由
-      wg_train/train.py 训练产出，推理接口与本文件其他 segmenter 完全一致。
+Note: real clinical deployment should use a trained segmentation model; the classic
+      baseline here is only for engineering comparison and getting the pipeline
+      running, not as an accuracy delivery criterion. WoundSegModel checkpoints are
+      produced by wg_train/train.py, and its inference interface is exactly the
+      same as the other segmenters in this file.
 """
 from __future__ import annotations
 
@@ -18,7 +23,8 @@ import numpy as np
 
 
 def _resolve_device(device: str | None) -> str:
-    """把 "auto"/None 解析为具体设备（MPS 优先，其次 CPU），无 torch 时回落 CPU。"""
+    """Resolve "auto"/None to a concrete device (MPS preferred, then CPU),
+    falling back to CPU when torch is unavailable."""
     if device in (None, "", "auto"):
         try:
             import torch
@@ -34,15 +40,17 @@ class BaseSegmenter:
     name = "base"
 
     def segment(self, rgb: np.ndarray):
-        """返回 (mask (H,W) uint8 0/255, info dict)。"""
+        """Return (mask (H,W) uint8 0/255, info dict)."""
         raise NotImplementedError
 
 
 class ColorThresholdSegmenter(BaseSegmenter):
-    """经典色彩阈值基线：在 LAB 空间对伤口色（偏红/暗红）做阈值 + 形态学闭合。
+    """Classic colour-threshold baseline: threshold wound colour (reddish/dark
+    red) in LAB space plus morphological closing.
 
-    对创面（肉芽红、坏死暗、黄痂）与健康肤色差异有效，但对光照/肤色敏感，
-    仅作基线。生产应替换为训练模型。
+    Effective at distinguishing wounds (red granulation, dark necrosis, yellow
+    eschar) from healthy skin, but sensitive to lighting/skin tone; baseline
+    only. Production should replace this with a trained model.
     """
 
     name = "color_threshold"
@@ -51,7 +59,7 @@ class ColorThresholdSegmenter(BaseSegmenter):
         try:
             import cv2
         except Exception:
-            # 无 opencv 时退化为中心块
+            # Fall back to a central patch when opencv is unavailable
             h, w = rgb.shape[:2]
             mask = np.zeros((h, w), np.uint8)
             mask[h // 3:2 * h // 3, w // 3:2 * w // 3] = 255
@@ -59,10 +67,11 @@ class ColorThresholdSegmenter(BaseSegmenter):
 
         rgb = np.ascontiguousarray(rgb)
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-        a = lab[:, :, 1].astype(np.float32)   # +a 偏红
-        b = lab[:, :, 2].astype(np.float32)   # +b 偏黄
+        a = lab[:, :, 1].astype(np.float32)   # +a reddish
+        b = lab[:, :, 2].astype(np.float32)   # +b yellowish
 
-        # 创面通常 a 较高（红）或 b 较高（黄痂）；综合 red-yellow 指标
+        # Wounds usually have high a (red) or high b (yellow eschar); combine
+        # into a red-yellow score
         score = (a - 128.0) + 0.6 * (b - 128.0)
         score = np.clip(score, 0, 255).astype(np.uint8)
         _, bin_mask = cv2.threshold(score, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -71,7 +80,7 @@ class ColorThresholdSegmenter(BaseSegmenter):
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel)
         bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN, kernel)
 
-        # 取最大连通域
+        # Keep the largest connected component
         num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, 8)
         if num > 1:
             largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
@@ -84,10 +93,12 @@ class ColorThresholdSegmenter(BaseSegmenter):
 
 
 class SyntheticWoundSegmenter(BaseSegmenter):
-    """演示用：在参考帧中心生成一枚椭圆伤口区域。
+    """For demos: generate an elliptical wound region at the centre of the
+    reference frame.
 
-    仅用于「样本数据尚无人工标注伤口」时的端到端 pipeline 演示，
-    输出 info['synthetic']=True 以明确区别于真实分割结果。
+    Only used for end-to-end pipeline demos when "the sample data has no manually
+    annotated wounds"; outputs info['synthetic']=True to clearly distinguish it
+    from real segmentation results.
     """
 
     name = "synthetic"
@@ -107,15 +118,17 @@ class SyntheticWoundSegmenter(BaseSegmenter):
 
 
 def _keep_largest_cc(mask: np.ndarray) -> np.ndarray:
-    """保留二值掩膜中面积最大的连通域（输入 0/255，输出 0/255）。
+    """Keep the largest-area connected component in a binary mask (0/255 in,
+    0/255 out).
 
-    与 ColorThresholdSegmenter 的"取最大连通域"行为对齐，抑制分割模型
-    在远离创面的皮肤瑕疵/反光处产生的零散误检。
+    Aligned with ColorThresholdSegmenter's "keep the largest connected
+    component" behaviour, suppressing scattered false detections by the
+    segmentation model at skin blemishes/reflections far from the wound.
     """
     try:
         import cv2
     except Exception:
-        return mask  # 无 opencv 时原样返回
+        return mask  # return unchanged when opencv is unavailable
     bin_mask = (mask > 0).astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, 8)
     if num <= 1:
@@ -125,17 +138,20 @@ def _keep_largest_cc(mask: np.ndarray) -> np.ndarray:
 
 
 class WoundSegModel(BaseSegmenter):
-    """对接训练好的分割模型（WoundUNet 骨干）的真实接口。
+    """Real interface wrapping a trained segmentation model (WoundUNet backbone).
 
-    与 ColorThresholdSegmenter / SyntheticWoundSegmenter 接口完全一致：
-    ``segment(rgb) -> (mask (H,W) 0/255, info dict)``，因此可直接传入
-    ``pipeline.run_pipeline(segmenter=WoundSegModel(...))`` 一键替换。
+    The interface is exactly the same as ColorThresholdSegmenter /
+    SyntheticWoundSegmenter: ``segment(rgb) -> (mask (H,W) 0/255, info dict)``,
+    so it can be passed directly to
+    ``pipeline.run_pipeline(segmenter=WoundSegModel(...))`` for a one-line
+    replacement.
 
     ``info`` carries ``synthetic=False`` plus ``prob_mean/prob_max``
-    用于后续置信度筛选与失败预警。
+    for subsequent confidence filtering and failure warning.
 
-    torch 懒加载：未安装 torch 或权重为空时，调用 ``segment`` 才会显式报错，
-    不影响其他 segmenter 的使用。
+    Lazy torch loading: if torch is not installed or the weights are empty, an
+    explicit error is raised only when ``segment`` is called, so other segmenters
+    are unaffected.
     """
 
     name = "trained_model"
@@ -161,8 +177,9 @@ class WoundSegModel(BaseSegmenter):
                 self._load()
             else:
                 raise RuntimeError(
-                    "WoundSegModel 未提供 weights_path；请先训练（wg_train/train.py）"
-                    "或传入模型权重，否则改用 ColorThresholdSegmenter / SyntheticWoundSegmenter。"
+                    "WoundSegModel was not given a weights_path; please train first "
+                    "(wg_train/train.py) or pass in model weights; otherwise use "
+                    "ColorThresholdSegmenter / SyntheticWoundSegmenter instead."
                 )
         from .seg_model import predict_proba
         proba = predict_proba(self._model, rgb, self.device, self.img_size)  # (H,W)

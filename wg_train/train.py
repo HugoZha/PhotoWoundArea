@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-train.py — 伤口分割模型训练 CLI
+train.py — wound segmentation model training CLI
 ================================
 
 Usage (synthetic data; runs without external datasets):
     python -m wg_train.train --synthetic 300 --epochs 25 --img_size 128 \
         --batch 8 --out runs/exp1
 
-用法（真实数据，标注到位后）:
+Usage (real data, once annotations are ready):
     python -m wg_train.train --image_dir data/images --mask_dir data/masks \
         --epochs 50 --out runs/exp_real
 
-输出:
-    <out>/best.pt        验证集 Dice 最优权重（含 config 元数据）
-    <out>/last.pt        最后一轮权重
-    <out>/train_log.json 逐轮 train/val 损失与 val-Dice
+Output:
+    <out>/best.pt        best validation-Dice weights (includes config metadata)
+    <out>/last.pt        last-epoch weights
+    <out>/train_log.json per-epoch train/val loss and val-Dice
 """
 from __future__ import annotations
 
@@ -50,8 +50,8 @@ def _dice_loss(proba, target, eps: float = 1e-6):
 
 
 def _tversky_loss(proba, target, alpha: float = 0.7, beta: float = 0.3, eps: float = 1e-6):
-    """Tversky 损失：alpha>beta 时偏向召回（减少小目标欠分割）。
-    alpha=beta=0.5 即退化为 Dice。"""
+    """Tversky loss: when alpha>beta it favors recall (reduces under-segmentation of small targets).
+    alpha=beta=0.5 degenerates to Dice."""
     p = proba.reshape(-1)
     t = target.reshape(-1)
     tp = (p * t).sum()
@@ -61,20 +61,21 @@ def _tversky_loss(proba, target, alpha: float = 0.7, beta: float = 0.3, eps: flo
 
 
 def _boundary_loss(proba, target, sigma: float = 5.0, k: int = 3, lam: float = 8.0):
-    """边界感知损失（设备原生，纯张量运算，无 scipy CPU↔GPU 往返）：
-    用形态学梯度（膨胀−腐蚀）得到 GT 掩膜轮廓，作为 BCE 的逐像素权重，
-    使梯度集中在创面边界像素上，直接压低边界误差——
-    对小创面（边界误差占面积比重大）增益最大。
-    proba/target: (B,1,H,W) 张量。返回标量。
+    """Boundary-aware loss (device-native, pure tensor ops, no scipy CPU<->GPU round trip):
+    obtain the GT mask contour via a morphological gradient (dilation - erosion) and use it as
+    per-pixel weights for BCE, concentrating gradients on wound-boundary pixels and directly
+    reducing boundary error —
+    the largest gain is for small wounds (where boundary error accounts for a large share of the area).
+    proba/target: (B,1,H,W) tensors. Returns a scalar.
     """
     import torch
     import torch.nn.functional as F
-    # max-pooling 实现膨胀/腐蚀（padding 保持尺寸）
+    # max-pooling implements dilation/erosion (padding preserves size)
     pad = k // 2
-    dil = -F.max_pool2d(-target, k, stride=1, padding=pad)   # 膨胀
-    ero = F.max_pool2d(target, k, stride=1, padding=pad)      # 腐蚀
-    boundary = (dil - ero).clamp(min=0.0)                      # 轮廓指示 (B,1,H,W)
-    w = 1.0 + lam * boundary                                    # 边界像素权重放大
+    dil = -F.max_pool2d(-target, k, stride=1, padding=pad)   # dilation
+    ero = F.max_pool2d(target, k, stride=1, padding=pad)      # erosion
+    boundary = (dil - ero).clamp(min=0.0)                      # contour indicator (B,1,H,W)
+    w = 1.0 + lam * boundary                                    # boundary-pixel weights amplified
     bce = F.binary_cross_entropy(proba, target, reduction="none")
     return (bce * w).mean() / w.mean().clamp(min=1.0)
 
@@ -93,7 +94,7 @@ def _make_loss(name: str, sigma: float, alpha: float, beta: float):
         def f(p, t):
             return _tversky_loss(p, t, alpha=alpha, beta=beta)
         return f
-    raise ValueError(f"未知损失: {name}")
+    raise ValueError(f"Unknown loss: {name}")
 
 
 def build_loaders(args, device):
@@ -101,7 +102,7 @@ def build_loaders(args, device):
     from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
     from wg_train.dataset import ImageMaskDataset, SyntheticSegDataset
 
-    # ---- split.json 按「组」过滤 + 小创面加权采样（小创面专项）----
+    # ---- split.json group filtering + small-wound weighted sampling (small-wound track) ----
     if getattr(args, "split_json", None):
         import json
         sp = json.load(open(args.split_json))
@@ -116,7 +117,7 @@ def build_loaders(args, device):
         va_ds = ImageMaskDataset(args.image_dir, args.mask_dir,
                                  img_size=args.img_size, augment=False,
                                  seed=args.seed, stems=va_stems)
-        # 小创面过采样：fg_frac 低于阈值的样本权重放大 small_boost 倍
+        # Small-wound oversampling: samples with fg_frac below the threshold get their weight multiplied by small_boost
         sampler = None
         if args.small_boost and args.small_boost > 0:
             fg = {s["stem"]: s.get("fg_frac", 1.0) for s in by_group.get(args.train_group, [])}
@@ -124,21 +125,21 @@ def build_loaders(args, device):
                  for st in tr_stems]
             sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)
             n_small = sum(1 for x in w if x > 1.0)
-            print(f"   小创面过采样: {n_small}/{len(w)} 样本权重×{args.small_boost}")
+            print(f"   small-wound oversampling: {n_small}/{len(w)} samples, weight ×{args.small_boost}")
         tr_ld = DataLoader(tr_ds, batch_size=args.batch, shuffle=(sampler is None),
                           sampler=sampler, num_workers=0)
         va_ld = DataLoader(va_ds, batch_size=args.batch, shuffle=False, num_workers=0)
-        print(f"   训练集 {len(tr_ds)} / 验证集 {len(va_ds)}（split.json 组划分，组内一致）")
+        print(f"   train set {len(tr_ds)} / val set {len(va_ds)} (split.json group split, consistent within groups)")
         return tr_ld, va_ld
 
-    # 显式 train/val 目录优先：由 build_public_splits 按「组」划分而来，
-    # 可防止同一患者同时出现在训练集与验证集（patient-level leakage）。
+    # Explicit train/val directories take priority: produced by build_public_splits with group-aware splitting,
+    # which prevents the same patient from appearing in both training and validation (patient-level leakage).
     if getattr(args, "train_image_dir", None):
         tr_ds = ImageMaskDataset(args.train_image_dir, args.train_mask_dir,
                                  img_size=args.img_size, augment=True, seed=args.seed)
         va_ds = ImageMaskDataset(args.val_image_dir, args.val_mask_dir,
                                  img_size=args.img_size, augment=False, seed=args.seed)
-        print(f"   训练集 {len(tr_ds)} / 验证集 {len(va_ds)}（外部划分，组内一致）")
+        print(f"   train set {len(tr_ds)} / val set {len(va_ds)} (external split, consistent within groups)")
         return (DataLoader(tr_ds, batch_size=args.batch, shuffle=True, num_workers=0),
                 DataLoader(va_ds, batch_size=args.batch, shuffle=False, num_workers=0))
 
@@ -175,62 +176,62 @@ def eval_val(model, val_ld, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    # 数据源（二选一）
+    # Data source (choose one)
     ap.add_argument("--synthetic", type=int, default=0,
-                    help="合成样本数（>0 时启用合成数据集，无需真实标注）")
-    ap.add_argument("--image_dir", default=None, help="真实 RGB 图目录")
-    ap.add_argument("--mask_dir", default=None, help="真实掩膜目录")
-    # 显式划分（推荐）：由 wg_train.build_public_splits 产出
-    ap.add_argument("--train_image_dir", default=None, help="训练集图像目录")
-    ap.add_argument("--train_mask_dir", default=None, help="训练集掩膜目录")
-    ap.add_argument("--val_image_dir", default=None, help="验证集图像目录")
-    ap.add_argument("--val_mask_dir", default=None, help="验证集掩膜目录")
+                    help="Number of synthetic samples (>0 enables the synthetic dataset, no real annotations needed)")
+    ap.add_argument("--image_dir", default=None, help="Directory of real RGB images")
+    ap.add_argument("--mask_dir", default=None, help="Directory of real masks")
+    # Explicit split (recommended): produced by wg_train.build_public_splits
+    ap.add_argument("--train_image_dir", default=None, help="Training-set image directory")
+    ap.add_argument("--train_mask_dir", default=None, help="Training-set mask directory")
+    ap.add_argument("--val_image_dir", default=None, help="Validation-set image directory")
+    ap.add_argument("--val_mask_dir", default=None, help="Validation-set mask directory")
     ap.add_argument("--val_ratio", type=float, default=0.2)
-    # 按 split.json 组划分（小创面专项：支持小创面过采样）
+    # Group split via split.json (small-wound track: supports small-wound oversampling)
     ap.add_argument("--split_json", default=None,
-                    help="split.json（含 samples[{stem,group,fg_frac}]），按 group 过滤训练/验证")
+                    help="split.json (contains samples[{stem,group,fg_frac}]); filter train/val by group")
     ap.add_argument("--train_group", default="train")
     ap.add_argument("--val_group", default="val")
-    # 损失函数（小创面专项）
+    # Loss function (small-wound track)
     ap.add_argument("--loss", default="bcedice", choices=["bcedice", "boundary", "tversky"],
-                    help="bcedice=基线; boundary=Dice+边界加权; tversky=偏向召回")
-    ap.add_argument("--sigma", type=float, default=5.0, help="boundary 损失的距离图尺度")
-    ap.add_argument("--alpha", type=float, default=0.7, help="tversky 假阴性权重")
-    ap.add_argument("--beta", type=float, default=0.3, help="tversky 假阳性权重")
-    # 小创面过采样
+                    help="bcedice=baseline; boundary=Dice+boundary weighting; tversky=recall-oriented")
+    ap.add_argument("--sigma", type=float, default=5.0, help="Distance-map scale for the boundary loss")
+    ap.add_argument("--alpha", type=float, default=0.7, help="tversky false-negative weight")
+    ap.add_argument("--beta", type=float, default=0.3, help="tversky false-positive weight")
+    # Small-wound oversampling
     ap.add_argument("--small_boost", type=float, default=0.0,
-                    help="fg_frac<small_frac 的样本权重放大倍数（0=不过采样）")
+                    help="Weight multiplier for samples with fg_frac<small_frac (0=no oversampling)")
     ap.add_argument("--small_frac", type=float, default=0.05,
-                    help="判定为「小创面」的前景占比阈值")
+                    help="Foreground-fraction threshold for classifying a sample as a 'small wound'")
     ap.add_argument("--wound_frac", type=float, default=0.20,
-                    help="合成样本中创面占比（仅合成数据生效）")
-    # 模型
+                    help="Wound fraction in synthetic samples (synthetic data only)")
+    # Model
     ap.add_argument("--base", type=int, default=32)
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--img_size", type=int, default=128)
-    # 训练
+    # Training
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--init", default=None,
-                    help="从已有 checkpoint 初始化权重（继续训练/微调），如 runs/exp1/best.pt")
+                    help="Initialize weights from an existing checkpoint (continue training/fine-tune), e.g. runs/exp1/best.pt")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save_every", type=int, default=0,
-                    help="每 N 轮额外存一份 epN.pt（便于中途评估/挑选，0=不存）")
-    # 运行
+                    help="Also save an epN.pt every N epochs (for intermediate evaluation/selection; 0=do not save)")
+    # Runtime
     ap.add_argument("--device", default="auto")
     ap.add_argument("--out", default="runs/exp1")
     args = ap.parse_args()
 
     if not HAS_TORCH:
-        print("❌ 训练需要 torch；请先 `pip install torch`。")
+        print("❌ Training requires torch; please run `pip install torch` first.")
         sys.exit(1)
     import torch
     from torch import nn
     from torch.utils.data import DataLoader
 
     device = _auto_device(args.device)
-    print(f"▶ 设备: {device} | 数据源: {'合成 x%d' % args.synthetic if args.synthetic else '真实'} "
+    print(f"▶ device: {device} | data source: {'synthetic x%d' % args.synthetic if args.synthetic else 'real'} "
           f"| img_size={args.img_size} | base={args.base} depth={args.depth}")
 
     os.makedirs(args.out, exist_ok=True)
@@ -238,11 +239,11 @@ def main():
 
     model = WoundUNet(in_ch=3, base=args.base, depth=args.depth).to(device)
     if args.init:
-        # 从既有权重出发继续训练。用途：欠拟合时加轮次不必从头再来（省一半时间）；
-        # 注意 out 换新目录，避免覆盖原 best.pt。
+        # Continue training from existing weights. Use case: when underfitting, add epochs without starting over (saves about half the time);
+        # note: use a new out directory to avoid overwriting the original best.pt.
         ck = torch.load(args.init, map_location=device, weights_only=False)
         model.load_state_dict(ck["state_dict"])
-        print(f"  从 {args.init} 初始化 (该权重 val_dice={ck.get('val_dice', '?')})")
+        print(f"  initialized from {args.init} (these weights val_dice={ck.get('val_dice', '?')})")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     loss_fn = _make_loss(args.loss, args.sigma, args.alpha, args.beta)
 
@@ -285,7 +286,7 @@ def main():
                            "small_boost": args.small_boost, "small_frac": args.small_frac},
                 "val_dice": val_dice, "epoch": epoch,
             }, os.path.join(args.out, f"ep{epoch}.pt"))
-    # 末轮也存
+    # Also save the final epoch
     torch.save({
         "state_dict": model.state_dict(),
         "config": {"in_ch": 3, "base": args.base, "depth": args.depth,
@@ -294,7 +295,7 @@ def main():
     }, os.path.join(args.out, "last.pt"))
     with open(os.path.join(args.out, "train_log.json"), "w") as f:
         json.dump(log, f, indent=2)
-    print(f"\n✅ 训练完成。最优 val_dice={best_dice:.4f}，权重: {os.path.join(args.out, 'best.pt')}")
+    print(f"\n✅ Training complete. Best val_dice={best_dice:.4f}, weights: {os.path.join(args.out, 'best.pt')}")
 
 
 if __name__ == "__main__":

@@ -3,24 +3,26 @@ curvature_prior.py — anatomical curvature prior for sparse depth
 ================================================
 
 Rationale:
-  消费级手机在无 LiDAR 时只有稀疏点云，缺乏逐像素深度。本模块用「人体
-  解剖部位统计曲率先验」把伤口区域所在的体表建模为参数化曲面
-  （平面 / 圆柱 / 球面），从而：
-    (a) 为任意像素提供深度（相机射线与参数曲面求交）—— 替代 LiDAR；
-    (b) 为每个表面点提供法向，进而给出「投影面积 -> 真实曲面面积」的
-        压缩补偿因子 1/|n·view|。
+  Consumer phones without LiDAR have only sparse point clouds, lacking per-pixel
+  depth. This module uses "statistical curvature priors of human anatomical parts"
+  to model the body surface containing the wound region as a parametric surface
+  (plane / cylinder / sphere), thereby:
+    (a) providing depth for any pixel (intersecting the camera ray with the
+        parametric surface) — replacing LiDAR;
+    (b) providing a normal for each surface point, and hence the compression
+        compensation factor 1/|n·view| for "projected area -> true surface area".
 
-典型部位预设（半径单位：米）：
-  limb_forearm  前臂   R≈0.040
-  limb_thigh    大腿   R≈0.070
-  heel          足跟   R≈0.030 (球面近似)
-  sacrum        骶尾   平面近似
+Typical part presets (radius in metres):
+  limb_forearm  forearm   R≈0.040
+  limb_thigh    thigh     R≈0.070
+  heel          heel      R≈0.030 (spherical approximation)
+  sacrum        sacrum    planar approximation
 """
 from __future__ import annotations
 
 import numpy as np
 
-# 解剖部位预设： (model_type, default_radius_m)
+# Anatomical part presets: (model_type, default_radius_m)
 PART_PRESETS = {
     "flat":        ("plane", 0.0),
     "sacrum":      ("plane", 0.0),
@@ -33,7 +35,7 @@ PART_PRESETS = {
 
 
 class BodyPartModel:
-    """参数化体表曲面基类。"""
+    """Base class for parametric body-surface models."""
 
     def __init__(self):
         self.surface_kind = "base"
@@ -42,14 +44,16 @@ class BodyPartModel:
         raise NotImplementedError
 
     def intersect_ray(self, o: np.ndarray, d: np.ndarray):
-        """返回 (hit_world_point (3,), t>0) 或 (None, None)。"""
+        """Return (hit_world_point (3,), t>0) or (None, None)."""
         raise NotImplementedError
 
     def foreshorten_factor(self, p: np.ndarray, cam_pos: np.ndarray) -> float:
-        """真实面积 / 投影面积 = 1/|n·view_hat|（夹角的余弦倒数）。
+        """True area / projected area = 1/|n·view_hat| (reciprocal of the cosine
+        of the angle).
 
-        当表面正对相机时 n·view≈1（无压缩）；斜视或曲面边缘 n·view 变小，
-        投影被压缩，需补偿放大。
+        When the surface faces the camera, n·view≈1 (no compression); for oblique
+        views or at surface edges n·view becomes smaller, the projection is
+        compressed and must be compensated by enlargement.
         """
         n = self.normal_at(p)
         view = cam_pos - p
@@ -114,7 +118,7 @@ class CylinderModel(BodyPartModel):
         for t in (sorted([(-b - sq) / a, (-b + sq) / a])):
             if t > 1e-6:
                 hit = o + t * d
-                # 仅取外表面（径向向外）
+                # Only take the outer surface (radially outward)
                 if np.dot(self._perp(hit - self.axis_point), self._perp(d)) < 0:
                     return hit, float(t)
         return None, None
@@ -148,19 +152,21 @@ class SphereModel(BodyPartModel):
 
 
 def fit_model_to_cloud(points: np.ndarray, planes=None, part_type: str = "limb_forearm"):
-    """由稀疏度量点云（+ARKit 平面）拟合部位参数化模型。
+    """Fit an anatomical parametric model from a sparse metric point cloud
+    (+ARKit planes).
 
     Args:
-        points: (N,3) 全局度量点云（米）。
-        planes: 可选，ARKit 平面列表（用于平面类部位）。
-        part_type: 部位类型键（见 PART_PRESETS）。
+        points: (N,3) global metric point cloud (metres).
+        planes: optional, list of ARKit planes (for planar parts).
+        part_type: part-type key (see PART_PRESETS).
     Returns:
-        BodyPartModel 实例。
+        a BodyPartModel instance.
     """
     model_type, default_R = PART_PRESETS.get(part_type, ("cylinder", 0.04))
     pts = np.asarray(points, dtype=float)
     if pts.shape[0] < 3:
-        # 退化：用预设构造一个以原点为中心的默认模型
+        # Degenerate case: build a default model centred at the origin using
+        # the preset
         if model_type == "plane":
             return PlaneModel([0, 0, 0], [0, 0, 1])
         if model_type == "sphere":
@@ -168,14 +174,14 @@ def fit_model_to_cloud(points: np.ndarray, planes=None, part_type: str = "limb_f
         return CylinderModel([0, 0, 0], [0, 1, 0], default_R)
 
     centroid = pts.mean(axis=0)
-    # PCA 主方向
+    # PCA principal direction
     cov = np.cov(pts.T)
     eigval, eigvec = np.linalg.eigh(cov)
     order = np.argsort(eigval)[::-1]
-    axis = eigvec[:, order[0]]  # 最大方差方向
+    axis = eigvec[:, order[0]]  # direction of maximum variance
 
     if model_type == "plane":
-        normal = eigvec[:, order[-1]]  # 最小方差方向 = 法向
+        normal = eigvec[:, order[-1]]  # direction of minimum variance = normal
         return PlaneModel(centroid, normal)
 
     if model_type == "sphere":
@@ -183,8 +189,9 @@ def fit_model_to_cloud(points: np.ndarray, planes=None, part_type: str = "limb_f
         R = R if 0.005 < R < 0.3 else default_R
         return SphereModel(centroid, R)
 
-    # cylinder（默认）
-    # 点到轴线（过 centroid 沿 axis）的垂直距离中位数作为半径
+    # cylinder (default)
+    # Use the median perpendicular distance from the points to the axis
+    # (through the centroid along axis) as the radius
     perp = pts - centroid
     perp_dist = np.linalg.norm(perp - np.outer(perp @ axis, axis), axis=1)
     R = float(np.median(perp_dist))

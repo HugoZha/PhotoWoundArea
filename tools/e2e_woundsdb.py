@@ -2,24 +2,25 @@
 # -*- coding: utf-8 -*-
 """e2e_woundsdb.py — end-to-end area measurement on real photographs and registered point clouds.
 
-链路（每个样本）：
-    photo.jpg (4896x3264, 专家掩膜同尺寸)
-      ├─(裁黑边)→ 分割模型 → 预测掩膜 ─┐
-      └─ mask.png = 专家掩膜 (GT) ────┤
-                                     │ SIFT+RANSAC 相似变换 (photo→stereo 左半 1024x768)
+Pipeline (per sample):
+    photo.jpg (4896x3264, expert mask at the same size)
+      ├─(crop black borders)→ segmentation model → predicted mask ─┐
+      └─ mask.png = expert mask (GT) ──────────────────────────────┤
+                                     │ SIFT+RANSAC similarity transform (photo→stereo left half 1024x768)
                                      ▼
-              stereo-mesh.ply 结构化点云 (1024x768，mesh[i,j]=img[j,i])
-                                     │ 三角化曲面积分（σ 按物理尺度平滑）
+              stereo-mesh.ply structured point cloud (1024x768, mesh[i,j]=img[j,i])
+                                     │ triangulated surface integration (σ smoothed at the physical scale)
                                      ▼
-              GT 曲面面积 vs 预测曲面面积 → 相对误差
+              GT surface area vs predicted surface area → relative error
 
-真值口径：专家掩膜映射到点云后三角化的曲面面积（真实皮肤几何 + 专家边界），
-          与「模型预测掩膜在同一块几何上」的面积之比，即为端到端误差。
+Ground-truth definition: the triangulated surface area after mapping the expert mask onto the point cloud
+          (real skin geometry + expert boundary), divided by the area of "the model-predicted mask on the
+          same piece of geometry" — this ratio is the end-to-end error.
 
-用法：
-    python tools/e2e_woundsdb.py --limit 6            # 冒烟
-    python tools/e2e_woundsdb.py                      # 全量 188
-    python tools/e2e_woundsdb.py --mode two_stage     # 两阶段 ROI 精化
+Usage:
+    python tools/e2e_woundsdb.py --limit 6            # smoke test
+    python tools/e2e_woundsdb.py                      # full run, all 188
+    python tools/e2e_woundsdb.py --mode two_stage     # two-stage ROI refinement
 """
 from __future__ import annotations
 
@@ -48,20 +49,23 @@ from wg_algorithms.segmentation import _keep_largest_cc  # noqa: E402
 
 PAT_ROOT = os.path.join(ROOT, "data/raw/woundsdb/patients_partial/patients")
 RES_ROOT = os.path.join(ROOT, "data/raw/woundsdb/results")
-PHOTO_SCALE = 0.25          # SIFT 用 1/4 分辨率的 photo（4896px 全跑太慢）
-MESH_H, MESH_W = 1024, 768  # 点云网格（行,列）；stereo 图是其转置
+PHOTO_SCALE = 0.25          # SIFT uses 1/4-resolution photo (running the full 4896px is too slow)
+MESH_H, MESH_W = 1024, 768  # point cloud grid (rows, cols); the stereo image is its transpose
 
 
-# ------------------------------------------------------------------ 配准
+# ------------------------------------------------------------------ registration
 def photo_to_stereo(photo_rgb, stereo_left, ratio=0.75, thr=3.0):
-    """SIFT + RANSAC 估计 photo→stereo 的相似变换。
+    """SIFT + RANSAC to estimate the photo→stereo similarity transform.
 
-    固定 OpenCV 随机种子，使 RANSAC 配准确定性、可复现（消融表要求
-    同一批样本逐层加组件，避免随机跳过导致 N 漂移）。
+    Fix the OpenCV random seed so RANSAC registration is deterministic and
+    reproducible (the ablation table requires adding components layer by layer
+    to the same batch of samples, avoiding random skips that make N drift).
 
-    返回 (M 2x3, inliers, n_good) 或 (None, 0, 0)。
-    为什么用相似变换而非单应：两台相机看同一平面创面，视差有限，
-    相似变换已足够把 ~0.3% 画面占比的掩膜搬过去，且约束更强、更抗漂移。
+    Returns (M 2x3, inliers, n_good), or (None, 0, 0).
+    Why a similarity transform rather than a homography: both cameras view the
+    same planar wound with limited parallax; a similarity transform is already
+    enough to transfer the mask (which covers ~0.3% of the frame), and is more
+    constrained and more robust against drift.
     """
     p_small = cv2.resize(photo_rgb, None, fx=PHOTO_SCALE, fy=PHOTO_SCALE,
                          interpolation=cv2.INTER_AREA)
@@ -85,19 +89,20 @@ def photo_to_stereo(photo_rgb, stereo_left, ratio=0.75, thr=3.0):
 
 
 def mask_photo_to_mesh(mask_photo_bin, M):
-    """photo 全分辨率二值掩膜 → 点云网格空间 (MESH_H, MESH_W)。
+    """photo full-resolution binary mask → point cloud grid space (MESH_H, MESH_W).
 
-    路径：photo →(x0.25)→ photo_small →(M)→ stereo(768,1024) →(转置)→ mesh(1024,768)。
-    转置依据 tools/probe_mesh_orient.py 的颜色相关性检验（0.76 vs 其余 <0.31）。
+    Path: photo →(x0.25)→ photo_small →(M)→ stereo(768,1024) →(transpose)→ mesh(1024,768).
+    The transpose is based on the color-correlation check in tools/probe_mesh_orient.py
+    (0.76 versus <0.31 for the rest).
     """
     h, w = mask_photo_bin.shape
     m_small = cv2.resize(mask_photo_bin, (int(w * PHOTO_SCALE), int(h * PHOTO_SCALE)),
                          interpolation=cv2.INTER_NEAREST)
-    # dsize=(宽,高)=(1024,768)：输出为 stereo 图像空间 (768 行,1024 列)
+    # dsize=(width,height)=(1024,768): the output is in stereo image space (768 rows, 1024 cols)
     st = cv2.warpAffine(m_small, M, (MESH_H, MESH_W),
                         flags=cv2.INTER_NEAREST, borderValue=0)
-    # 必须二值化：warp 输出是 0/255，直接当 0/1 权重会把面积放大 255 倍
-    return (st.T > 127).astype(np.uint8)  # (1024,768) 点云网格空间
+    # Must binarize: warp outputs 0/255; using them directly as 0/1 weights would inflate the area 255x
+    return (st.T > 127).astype(np.uint8)  # (1024,768) point cloud grid space
 
 
 def read_ply_grid_any(path: str, shape):
@@ -112,13 +117,13 @@ def read_ply_grid_any(path: str, shape):
     with open(path, "rb") as f:
         head = f.read(4096)
         if b"format ascii" in head.split(b"end_header")[0]:
-            # --- ascii 分支 ---
+            # --- ascii branch ---
             import pandas as pd
             f.seek(0)
             raw = f.read()
             hdr_end = raw.index(b"end_header") + len(b"end_header")
             lines = raw[hdr_end:].split(b"\n")
-            # 跳过 header 尾的空行
+            # skip blank lines at the end of the header
             rows = [l for l in lines if l.strip()]
             del lines, raw
             df = pd.DataFrame(
@@ -127,14 +132,14 @@ def read_ply_grid_any(path: str, shape):
             h, w = shape
             nv = len(df)
             if h * w != nv:
-                raise ValueError(f"{path}: {nv} 点与 {h}x{w} 不符")
+                raise ValueError(f"{path}: {nv} points do not match {h}x{w}")
             xyz = np.stack([df.x, df.y, df.z], 1).reshape(h, w, 3)
             rgb = np.stack([df.r, df.g, df.b], 1).reshape(h, w, 3).astype(np.uint8)
             return xyz, rgb
-        # --- binary 分支（逻辑同 validate_real_surface.read_ply_grid，header 有界）---
+        # --- binary branch (same logic as validate_real_surface.read_ply_grid, bounded header) ---
         import struct as _s
         hdr_end = head.index(b"end_header") + len(b"end_header")
-        # 吃掉紧跟的行尾
+        # consume the immediately following line ending
         while head[hdr_end:hdr_end + 1] in (b"\r", b"\n"):
             hdr_end += 1
         nv = int([l for l in head[:hdr_end].decode().split("\n")
@@ -146,13 +151,13 @@ def read_ply_grid_any(path: str, shape):
             d = np.frombuffer(f.read(nv * dt.itemsize), dtype=dt, count=nv)
     h, w = shape
     if h * w != nv:
-        raise ValueError(f"{path}: {nv} 点与 {h}x{w} 不符")
+        raise ValueError(f"{path}: {nv} points do not match {h}x{w}")
     return (np.stack([d["x"], d["y"], d["z"]], 1).reshape(h, w, 3),
             np.stack([d["r"], d["g"], d["b"]], 1).reshape(h, w, 3))
 
 
 def align_pinhole_fast(xyz_mm, n_sample: int = 60000):
-    """align_pinhole 的抽样加速版（拟合 6 万点 vs 全量 70 万点，精度不变）。"""
+    """Sampled, accelerated version of align_pinhole (fits 60k points vs 700k in full, same accuracy)."""
     h, w, _ = xyz_mm.shape
     v, u = np.mgrid[0:h, 0:w].astype(np.float64)
     best = (np.inf, None, None)
@@ -181,9 +186,9 @@ def align_pinhole_fast(xyz_mm, n_sample: int = 60000):
     return best
 
 
-# ------------------------------------------------------------------ 分割
+# ------------------------------------------------------------------ segmentation
 def crop_black_borders(img: np.ndarray, thr: int = 12):
-    """裁掉连续纯黑边框，返回 (crop, (top, left))。同 tools/crop_black_border.py 口径。"""
+    """Crop contiguous pure-black borders, returns (crop, (top, left)). Same convention as tools/crop_black_border.py."""
     m = (img.max(axis=2) <= thr)
     if m.all():
         return img, (0, 0)
@@ -212,11 +217,12 @@ def crop_black_borders(img: np.ndarray, thr: int = 12):
 
 def predict_mask(model, device, photo_rgb, mode="full", thr=0.5, img_size=256,
                  mask_roi_hint=None, tta=False):
-    """返回 photo 坐标系下的二值预测掩膜。
+    """Return the binary predicted mask in photo coordinates.
 
-    full:       整图 resize 到 256 直接预测（模拟远拍，最坏情况）；
-    two_stage:  先 full 粗预测，再以粗质心为中心裁 1/6 幅面 ROI 放大精预测
-                （模拟 App 近拍场景；粗预测为空则退化 full）。
+    full:       resize the whole image to 256 and predict directly (simulates distant shooting, worst case);
+    two_stage:  first a coarse full-frame prediction, then crop a 1/6-frame ROI centered on the coarse
+                centroid and enlarge it for a fine prediction (simulates the app's close-up scenario;
+                if the coarse prediction is empty, fall back to full).
     """
     from wg_algorithms.seg_model import predict_proba
 
@@ -248,9 +254,10 @@ def predict_mask(model, device, photo_rgb, mode="full", thr=0.5, img_size=256,
     pred = (proba >= thr).astype(np.uint8) * 255
 
     if mode == "tile":
-        # 滑窗推理：远拍全图里创面只占 ~0.3%，直接 resize 到 256 远低于训练分布
-        # （中位 6.8%）。把原图切成 ~0.9MP 的重叠小块逐块预测再均值融合，
-        # 每块里创面占比被放大约 30 倍，回到训练分布；无需任何 GT 信息。
+        # Sliding-window inference: in a distant full-frame shot the wound covers only ~0.3%, so resizing
+        # directly to 256 is far below the training distribution (median 6.8%). Cut the original into
+        # overlapping ~0.9MP tiles, predict each, then average-fuse; the wound fraction in each tile is
+        # enlarged about 30x, back into the training distribution; no GT information is needed.
         H, W = photo_rgb.shape[:2]
         tile, stride = 896, 448
         acc = np.zeros((H, W), np.float32)
@@ -268,8 +275,9 @@ def predict_mask(model, device, photo_rgb, mode="full", thr=0.5, img_size=256,
         pred = (proba >= thr).astype(np.uint8) * 255
 
     if mode == "roi":
-        # 模拟 App 近拍取景：GT 掩膜**只用于决定「用户把镜头对准创面」的画幅**
-        # （真实系统里取景由用户完成），不参与分割、阈值与面积计算。
+        # Simulate the app's close-up framing: the GT mask is used **only** to decide the frame in which
+        # "the user points the camera at the wound" (in a real system framing is done by the user); it
+        # takes no part in segmentation, thresholding, or area computation.
         ys, xs = np.where(mask_roi_hint > 127)
         cy, cx = float(ys.mean()), float(xs.mean())
         size = int(max(ys.max() - ys.min(), xs.max() - xs.min()) * 2.5)
@@ -293,7 +301,7 @@ def predict_mask(model, device, photo_rgb, mode="full", thr=0.5, img_size=256,
     return _keep_largest_cc(pred)
 
 
-# ------------------------------------------------------------------ 主流程
+# ------------------------------------------------------------------ main pipeline
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="runs/publicA_cropped_ft/best.pt")
@@ -301,15 +309,16 @@ def main() -> int:
     ap.add_argument("--mode", default="full", choices=["full", "tile", "roi", "two_stage"])
     ap.add_argument("--thr", type=float, default=0.5)
     ap.add_argument("--smooth_mm", type=float, default=6.0,
-                    help="法向/GT 共用的物理平滑尺度")
+                    help="physical smoothing scale shared by the normal and GT")
     ap.add_argument("--min_cov", type=float, default=0.8)
-    ap.add_argument("--tta", action="store_true", help="水平翻转 TTA 平均")
+    ap.add_argument("--tta", action="store_true", help="horizontal-flip TTA averaging")
     ap.add_argument("--only_group", default=None, choices=["train", "val", "test"],
-                    help="只评估指定分组（按 case 划分）。用于排除已参与训练的样本，"
-                         "避免端到端指标被训练样本污染。")
+                    help="Evaluate only the specified group (split by case). Used to exclude samples "
+                         "already used in training, so the end-to-end metrics are not polluted by "
+                         "training samples.")
     ap.add_argument("--split_file", default="data/woundsdb_seg_ms/split.json")
     ap.add_argument("--device", default="auto")
-    ap.add_argument("--vis", type=int, default=8, help="保存几张可视化")
+    ap.add_argument("--vis", type=int, default=8, help="how many visualizations to save")
     ap.add_argument("--out", default="runs/e2e_woundsdb")
     args = ap.parse_args()
 
@@ -321,9 +330,9 @@ def main() -> int:
         device = ("mps" if getattr(torch.backends, "mps", None)
                   and torch.backends.mps.is_available() else "cpu")
     model = load_wound_model(os.path.join(ROOT, args.model), device=device)
-    print(f"▶ 模型 {args.model} | 设备 {device} | 推理模式 {args.mode}")
+    print(f"▶ model {args.model} | device {device} | inference mode {args.mode}")
 
-    # ---- 配对清单
+    # ---- paired-case list
     cases = []
     for mp in sorted(glob.glob(os.path.join(PAT_ROOT, "case_*", "day_*",
                                             "data", "scene_*", "mask.png"))):
@@ -336,7 +345,7 @@ def main() -> int:
         if os.path.exists(res):
             cases.append((d, res, rel))
 
-    # ---- 按 case 分组过滤（防止训练样本混入端到端评测）
+    # ---- filter by case group (prevent training samples from leaking into the end-to-end evaluation)
     if args.only_group:
         sp = json.load(open(os.path.join(ROOT, args.split_file)))
         case2grp = {}
@@ -347,9 +356,9 @@ def main() -> int:
             c = item[2].split(os.sep)[0]
             if case2grp.get(c) == args.only_group:
                 keep.append(item)
-        print(f"▶ 只评估 {args.only_group} 组：{len(keep)}/{len(cases)} 个配对样本")
+        print(f"▶ evaluating only the {args.only_group} group: {len(keep)}/{len(cases)} paired samples")
         cases = keep
-    print(f"▶ 配对样本 {len(cases)} 个（mask+stereo_l+mesh 三全）")
+    print(f"▶ {len(cases)} paired samples (all three of mask+stereo_l+mesh present)")
     if args.limit:
         cases = cases[: args.limit]
 
@@ -378,7 +387,7 @@ def main() -> int:
 
             keep_gt = mask_photo_to_mesh(mask_gt, M)
             if keep_gt.sum() < 150:
-                skips.append({"rel": rel, "why": f"gt 映射后仅 {int(keep_gt.sum())}px"})
+                skips.append({"rel": rel, "why": f"gt has only {int(keep_gt.sum())}px after mapping"})
                 continue
 
             pred = predict_mask(model, device, photo, mode=args.mode, thr=args.thr,
@@ -399,10 +408,10 @@ def main() -> int:
             gt_mm2, cov_gt = triangle_area_over_region(xyz_s, keep_gt, max_gap_mm=gap)
             pred_mm2, cov_pr = triangle_area_over_region(xyz_s, keep_pred, max_gap_mm=gap)
             if gt_mm2 <= 0 or cov_gt < args.min_cov:
-                skips.append({"rel": rel, "why": f"gt 点云质量 cov={cov_gt:.2f}"})
+                skips.append({"rel": rel, "why": f"gt point-cloud quality cov={cov_gt:.2f}"})
                 continue
             if pred_mm2 <= 0:
-                pred_mm2 = 0.0          # 模型漏检：面积 0 是合法结果
+                pred_mm2 = 0.0          # model missed detection: area 0 is a valid result
 
             gt_cm2, pr_cm2 = gt_mm2 / 100.0, pred_mm2 / 100.0
             err = abs(pr_cm2 - gt_cm2) / gt_cm2 * 100.0
@@ -417,7 +426,7 @@ def main() -> int:
                 "n_gt_px": int(keep_gt.sum()), "n_pred_px": int(keep_pred.sum()),
             })
             print(f"  [{idx+1}/{len(cases)}] {rel}  GT {gt_cm2:.2f} cm² "
-                  f"预测 {pr_cm2:.2f} cm²  误差 {err:.1f}%  dice {dice2d:.3f}"
+                  f"pred {pr_cm2:.2f} cm²  error {err:.1f}%  dice {dice2d:.3f}"
                   f"  ({_time.time()-t0:.1f}s)", flush=True)
 
             if vis_saved < args.vis:
@@ -432,9 +441,9 @@ def main() -> int:
                 ax[0].imshow(p_small)
                 ax[0].contour(m_small, levels=[0.5], colors="g", linewidths=1.2)
                 ax[0].contour(pred_s, levels=[0.5], colors="r", linewidths=1.2)
-                ax[0].set_title(f"photo  GT(绿)/Pred(红)  {rel.split('/')[-1]}")
+                ax[0].set_title(f"photo  GT(green)/Pred(red)  {rel.split('/')[-1]}")
                 ax[0].axis("off")
-                # 点云深度渲染 + 两掩膜轮廓（mesh 空间，转置回图像向）
+                # point cloud depth rendering + both mask contours (mesh space, transposed back to image orientation)
                 z = xyz_s[:, :, 2].copy()
                 z[~np.isfinite(z)] = np.nanmedian(z)
                 zn = (z - np.nanpercentile(z, 2)) / max(np.nanpercentile(z, 98)
@@ -442,7 +451,7 @@ def main() -> int:
                 ax[1].imshow(zn.T, cmap="gray")
                 ax[1].contour(keep_gt.T.astype(float), levels=[0.5], colors="lime", linewidths=1.2)
                 ax[1].contour(keep_pred.T.astype(float), levels=[0.5], colors="r", linewidths=1.2)
-                ax[1].set_title(f"点云深度  GT {gt_cm2:.2f} vs Pred {pr_cm2:.2f} cm²")
+                ax[1].set_title(f"point-cloud depth  GT {gt_cm2:.2f} vs Pred {pr_cm2:.2f} cm²")
                 ax[1].axis("off")
                 plt.tight_layout()
                 plt.savefig(os.path.join(ROOT, args.out, f"vis_{vis_saved:02d}.png"), dpi=110)
@@ -451,9 +460,9 @@ def main() -> int:
             skips.append({"rel": rel, "why": f"{type(ex).__name__}: {str(ex)[:90]}"})
             print(f"  [{idx+1}/{len(cases)}] SKIP {rel} ({_time.time()-t0:.1f}s)", flush=True)
 
-    # ---- 汇总
+    # ---- summary
     if not integ_rows:
-        print(f"❌ 无有效样本。跳过 {len(skips)} 条：")
+        print(f"❌ No valid samples. Skipped {len(skips)}:")
         for s in skips[:10]:
             print("   ", s)
         return 1
@@ -462,18 +471,19 @@ def main() -> int:
     gts = np.array([r["gt_cm2"] for r in integ_rows])
     prs = np.array([r["pred_cm2"] for r in integ_rows])
     dcs = np.array([r["dice_2d_mesh"] for r in integ_rows])
-    # 像素比（模型/专家）与面积比（模型/专家）——用于诊断偏置来源
+    # pixel ratio (model/expert) and area ratio (model/expert) — for diagnosing the source of bias
     pxr = np.array([r["n_pred_px"] / max(r["n_gt_px"], 1) for r in integ_rows])
     ar = prs / gts
 
-    # ---- 按创面大小分层（阈值 18.7cm²，与既往分析一致）
+    # ---- stratify by wound size (threshold 18.7cm², consistent with previous analysis)
     THR = 18.7
     small = gts < THR
     large = ~small
 
-    # ---- 系统偏置与几何保真度（MedIA 归因：偏置来自掩膜分歧还是几何口径？）
-    offsets = (prs - gts) / gts * 100.0          # 带符号偏置
-    faith_r = float(np.corrcoef(pxr, ar)[0, 1])  # ≈1 → 几何积分忠实于掩膜
+    # ---- systematic bias and geometric fidelity (MedIA attribution: does bias come from mask
+    #      disagreement or from the geometry definition?)
+    offsets = (prs - gts) / gts * 100.0          # signed bias
+    faith_r = float(np.corrcoef(pxr, ar)[0, 1])  # ≈1 → geometric integration is faithful to the mask
     from collections import defaultdict
     bycase = defaultdict(list)
     for r, o in zip(integ_rows, offsets):
@@ -483,32 +493,33 @@ def main() -> int:
         if int(mask.sum()) == 0:
             return
         e = errs[mask]
-        print(f"  {name} (N={int(mask.sum())}): 中位误差 {np.median(e):.1f}%  "
-              f"<10%占{(e < 10).mean()*100:.0f}%  dice中位 {np.median(dcs[mask]):.3f}  "
-              f"面积中位 {np.median(gts[mask]):.1f}cm²")
+        print(f"  {name} (N={int(mask.sum())}): median error {np.median(e):.1f}%  "
+              f"<10% share {(e < 10).mean()*100:.0f}%  median dice {np.median(dcs[mask]):.3f}  "
+              f"median area {np.median(gts[mask]):.1f}cm²")
 
     print("\n" + "=" * 74)
-    print(f"端到端面积验证（真实分割 + 真实点云）  N={len(integ_rows)}"
-          f"  跳过 {len(skips)}")
+    print(f"End-to-end area validation (real segmentation + real point cloud)  N={len(integ_rows)}"
+          f"  skipped {len(skips)}")
     print("=" * 74)
-    print(f"  面积相对误差: 均值 {errs.mean():.1f}%  中位 {np.median(errs):.1f}%  "
-          f"P90 {np.percentile(errs, 90):.1f}%  最大 {errs.max():.1f}%")
-    print(f"  误差<10% 占比 {(errs<10).mean()*100:.0f}%   <20% 占比 {(errs<20).mean()*100:.0f}%")
-    print(f"  真值面积: 中位 {np.median(gts):.2f} cm² ({gts.min():.2f}~{gts.max():.2f})")
-    print(f"  与真值相关 R = {np.corrcoef(gts, prs)[0,1]:.3f}")
-    print(f"  mesh 上 2D dice: 中位 {np.median(dcs):.3f}")
-    print("\n--- 按创面大小分层（阈值 %.1f cm²）---" % THR)
-    _stratum(small, "  小创面 (<%.1f cm²)" % THR)
-    _stratum(large, "  大创面 (>=%.1f cm²)" % THR)
-    print("\n--- 系统偏置与几何保真度（真值口径校准诊断）---")
-    print(f"  带符号面积偏置中位 {np.median(offsets):+.1f}%  "
-          f"高估占比 {(offsets > 0).mean()*100:.0f}%")
-    print(f"  面积比 vs 像素比 相关 R={faith_r:.3f}  "
-          f"（≈1 说明几何积分忠实于分割掩膜，偏置源自掩膜分歧而非几何口径）")
-    print("  逐 case 带符号偏置中位:")
+    print(f"  area relative error: mean {errs.mean():.1f}%  median {np.median(errs):.1f}%  "
+          f"P90 {np.percentile(errs, 90):.1f}%  max {errs.max():.1f}%")
+    print(f"  error<10% share {(errs<10).mean()*100:.0f}%   <20% share {(errs<20).mean()*100:.0f}%")
+    print(f"  ground-truth area: median {np.median(gts):.2f} cm² ({gts.min():.2f}~{gts.max():.2f})")
+    print(f"  correlation with ground truth R = {np.corrcoef(gts, prs)[0,1]:.3f}")
+    print(f"  2D dice on mesh: median {np.median(dcs):.3f}")
+    print("\n--- stratification by wound size (threshold %.1f cm²) ---" % THR)
+    _stratum(small, "  small wounds (<%.1f cm²)" % THR)
+    _stratum(large, "  large wounds (>=%.1f cm²)" % THR)
+    print("\n--- systematic bias and geometric fidelity (ground-truth definition calibration diagnostics) ---")
+    print(f"  median signed area bias {np.median(offsets):+.1f}%  "
+          f"overestimation share {(offsets > 0).mean()*100:.0f}%")
+    print(f"  area ratio vs pixel ratio correlation R={faith_r:.3f}  "
+          f"(≈1 means geometric integration is faithful to the segmentation mask, so the bias "
+          f"stems from mask disagreement rather than from the geometry definition)")
+    print("  median signed bias per case:")
     for c in sorted(bycase):
         ol = bycase[c]
-        print(f"    {c}: N={len(ol)} 中位 {np.median(ol):+.1f}%  "
+        print(f"    {c}: N={len(ol)} median {np.median(ol):+.1f}%  "
               f"{'⚠' if abs(np.median(ol)) > 15 else ''}")
 
     summary = {
@@ -545,7 +556,7 @@ def main() -> int:
     with open(os.path.join(ROOT, args.out, "results.json"), "w") as f:
         json.dump({"config": vars(args), "rows": integ_rows, "skips": skips,
                    "summary": summary}, f, indent=2, ensure_ascii=False)
-    print(f"\n✅ 明细 -> {args.out}/results.json   可视化 -> {args.out}/vis_*.png")
+    print(f"\n✅ details -> {args.out}/results.json   visualizations -> {args.out}/vis_*.png")
     return 0
 
 
