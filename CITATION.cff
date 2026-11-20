@@ -12,10 +12,12 @@ authors:
     given-names: Guopei
   - family-names: Zhang
     given-names: Chi
+  - family-names: Han
+    given-names: Wenjie
   - family-names: Zha
     given-names: Yuguo
 year: 2026
-version: 0.1.0
+version: 0.1.1
 license: MIT
 repository-code: "https://github.com/HugoZha/PhotoWoundArea"
 keywords:
@@ -32,6 +34,8 @@ preferred-citation:
       given-names: Guopei
     - family-names: Zhang
       given-names: Chi
+    - family-names: Han
+      given-names: Wenjie
     - family-names: Zha
       given-names: Yuguo
   title: "SynthWound: An Analytic Benchmark and Attribution Framework for Photographic Wound Area Measurement"
